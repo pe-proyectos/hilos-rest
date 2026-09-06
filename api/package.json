@@ -1,0 +1,22 @@
+{
+  "name": "hilos-rest-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "start": "bunx prisma generate && bun src/index.ts",
+    "db:push": "bunx prisma db push",
+    "generate": "bunx prisma generate",
+    "seed": "bun src/scripts/seed.ts"
+  },
+  "dependencies": {
+    "elysia": "^1.1.0",
+    "@elysiajs/cors": "^1.1.0",
+    "@prisma/client": "^5.20.0"
+  },
+  "devDependencies": {
+    "prisma": "^5.20.0",
+    "@types/bun": "latest"
+  }
+}

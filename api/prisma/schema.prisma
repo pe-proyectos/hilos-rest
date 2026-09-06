@@ -1,0 +1,180 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Cuenta de desarrollador (dueño de apps). hilos.rest NO autentica end-users:
+// solo devs. Los end-users se autentican en la app del consumidor.
+model Developer {
+  id           Int      @id @default(autoincrement())
+  email        String   @unique @db.VarChar(256)
+  name         String?  @db.VarChar(120)
+  passwordHash String?  @db.VarChar(256)
+  createdAt    DateTime @default(now()) @db.Timestamp(6)
+  apps         App[]
+
+  @@map("developer")
+}
+
+// Un App = un tenant social. Puede emitir varias API keys (una por consumidor).
+model App {
+  id          Int      @id @default(autoincrement())
+  developerId Int
+  name        String   @db.VarChar(120)
+  slug        String   @unique @db.VarChar(120)
+  createdAt   DateTime @default(now()) @db.Timestamp(6)
+  developer   Developer @relation(fields: [developerId], references: [id], onDelete: Cascade)
+  keys        ApiKey[]
+  pages       Page[]
+  posts       Post[]
+  comments    Comment[]
+
+  @@map("app")
+}
+
+model ApiKey {
+  id             Int       @id @default(autoincrement())
+  appId          Int
+  label          String    @db.VarChar(120)
+  type           String    @db.VarChar(16) // 'secret' | 'publishable'
+  prefix         String    @db.VarChar(16) // parte visible (sk_live_ab12)
+  keyHash        String    @unique @db.VarChar(128) // sha256(clave completa)
+  allowedOrigins String?   @db.VarChar(1000)
+  revokedAt      DateTime?
+  createdAt      DateTime  @default(now()) @db.Timestamp(6)
+  app            App       @relation(fields: [appId], references: [id], onDelete: Cascade)
+
+  @@index([appId])
+  @@map("api_key")
+}
+
+// La primitiva-actor. Un usuario, un scan, una obra (subpage), o custom.
+model Page {
+  id            Int       @id @default(autoincrement())
+  appId         Int
+  handle        String    @db.VarChar(64)
+  type          String    @default("user") @db.VarChar(24) // user | scan | manga | custom
+  parentPageId  Int?
+  externalId    String?   @db.VarChar(256) // id del usuario/entidad en la app del consumidor
+  displayName   String?   @db.VarChar(200)
+  avatarUrl     String?
+  bio           String?   @db.VarChar(600)
+  metadata      Json?
+  followersCount Int      @default(0)
+  followingCount Int      @default(0)
+  postsCount    Int       @default(0)
+  createdAt     DateTime  @default(now()) @db.Timestamp(6)
+  updatedAt     DateTime  @updatedAt
+  app           App       @relation(fields: [appId], references: [id], onDelete: Cascade)
+  parent        Page?     @relation("PageSubpages", fields: [parentPageId], references: [id], onDelete: Cascade)
+  subpages      Page[]    @relation("PageSubpages")
+  authoredPosts Post[]    @relation("PostAuthor")
+  wallPosts     Post[]    @relation("PostWall")
+  comments      Comment[]
+
+  @@unique([appId, handle])
+  @@unique([appId, externalId])
+  @@index([appId, parentPageId])
+  @@index([appId, type])
+  @@map("page")
+}
+
+// Post en el muro (wallPage) escrito por una page autora.
+model Post {
+  id            Int       @id @default(autoincrement())
+  appId         Int
+  authorPageId  Int
+  wallPageId    Int
+  content       String    @db.Text
+  media         Json?
+  repostOfId    Int?
+  externalRef   String?   @db.VarChar(256) // ej. 'chapter:123' para dedupe en migracion/auto-post
+  metadata      Json?
+  likesCount    Int       @default(0)
+  commentsCount Int       @default(0)
+  repostCount   Int       @default(0)
+  pinned        Boolean   @default(false)
+  deletedAt     DateTime?
+  hiddenAt      DateTime?
+  createdAt     DateTime  @default(now()) @db.Timestamp(6)
+  updatedAt     DateTime  @updatedAt
+  app           App       @relation(fields: [appId], references: [id], onDelete: Cascade)
+  author        Page      @relation("PostAuthor", fields: [authorPageId], references: [id], onDelete: Cascade)
+  wall          Page      @relation("PostWall", fields: [wallPageId], references: [id], onDelete: Cascade)
+  repostOf      Post?     @relation("PostReposts", fields: [repostOfId], references: [id], onDelete: SetNull)
+  reposts       Post[]    @relation("PostReposts")
+  comments      Comment[]
+  hashtags      Hashtag[]
+
+  @@unique([appId, externalRef])
+  @@index([appId, wallPageId, createdAt])
+  @@index([appId, authorPageId, createdAt])
+  @@index([appId, createdAt])
+  @@map("post")
+}
+
+model Comment {
+  id              Int       @id @default(autoincrement())
+  appId           Int
+  postId          Int
+  authorPageId    Int
+  parentCommentId Int?
+  content         String    @db.Text
+  likesCount      Int       @default(0)
+  deletedAt       DateTime?
+  hiddenAt        DateTime?
+  createdAt       DateTime  @default(now()) @db.Timestamp(6)
+  updatedAt       DateTime  @updatedAt
+  app             App       @relation(fields: [appId], references: [id], onDelete: Cascade)
+  post            Post      @relation(fields: [postId], references: [id], onDelete: Cascade)
+  author          Page      @relation(fields: [authorPageId], references: [id], onDelete: Cascade)
+  parent          Comment?  @relation("CommentReplies", fields: [parentCommentId], references: [id], onDelete: Cascade)
+  replies         Comment[] @relation("CommentReplies")
+
+  @@index([appId, postId, createdAt])
+  @@map("comment")
+}
+
+// Reaccion generica (like y futuras) sobre post o comment.
+model Reaction {
+  id         Int      @id @default(autoincrement())
+  appId      Int
+  targetType String   @db.VarChar(12) // 'post' | 'comment'
+  targetId   Int
+  pageId     Int
+  type       String   @default("like") @db.VarChar(24)
+  createdAt  DateTime @default(now()) @db.Timestamp(6)
+
+  @@unique([appId, targetType, targetId, pageId, type])
+  @@index([appId, targetType, targetId])
+  @@map("reaction")
+}
+
+model Follow {
+  id             Int      @id @default(autoincrement())
+  appId          Int
+  followerPageId Int
+  followedPageId Int
+  createdAt      DateTime @default(now()) @db.Timestamp(6)
+
+  @@unique([appId, followerPageId, followedPageId])
+  @@index([appId, followedPageId])
+  @@map("follow")
+}
+
+model Hashtag {
+  id        Int      @id @default(autoincrement())
+  appId     Int
+  postId    Int
+  tag       String   @db.VarChar(80)
+  createdAt DateTime @default(now()) @db.Timestamp(6)
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@index([appId, tag, createdAt])
+  @@index([postId])
+  @@map("hashtag")
+}
