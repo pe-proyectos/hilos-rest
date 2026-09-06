@@ -1,7 +1,7 @@
 import { Elysia, t } from 'elysia'
 import { prisma } from '../lib/prisma'
 import { resolveAuth, actingPage, type AuthCtx } from '../plugins/auth'
-import { signJwt } from '../lib/crypto'
+import { signJwt, generateApiKey } from '../lib/crypto'
 
 const SECRET = process.env.HILOS_JWT_SECRET || 'dev-secret'
 const MAX_CONTENT = 8000
@@ -43,6 +43,21 @@ export const v1 = () =>
   new Elysia({ prefix: '/v1' })
     .derive(async ({ request }) => ({ auth: await resolveAuth(request.headers) as AuthCtx | null }))
     .get('/health', () => ({ ok: true, service: 'hilos.rest', version: '0.1.0' }))
+
+    // Bootstrap unico: crea el dev+app+keys si no existe ninguna app todavia.
+    // Protegido por HILOS_BOOTSTRAP_TOKEN; inerte tras el primer uso.
+    .post('/bootstrap', async ({ request, body }: any) => {
+      const token = request.headers.get('x-bootstrap-token')
+      if (!process.env.HILOS_BOOTSTRAP_TOKEN || token !== process.env.HILOS_BOOTSTRAP_TOKEN) return { error: 'forbidden' }
+      const count = await prisma.app.count()
+      if (count > 0) return { error: 'already_bootstrapped' }
+      const dev = await prisma.developer.create({ data: { email: body?.email || 'admin@capibaratraductor.com', name: 'Capibara' } })
+      const app = await prisma.app.create({ data: { developerId: dev.id, name: body?.appName || 'La Charca', slug: body?.appSlug || 'lacharca' } })
+      const sk = generateApiKey('secret'); const pk = generateApiKey('publishable')
+      await prisma.apiKey.create({ data: { appId: app.id, label: 'server', type: 'secret', prefix: sk.prefix, keyHash: sk.hash } })
+      await prisma.apiKey.create({ data: { appId: app.id, label: 'client', type: 'publishable', prefix: pk.prefix, keyHash: pk.hash } })
+      return { data: { appId: app.id, appSlug: app.slug, secretKey: sk.full, publishableKey: pk.full } }
+    })
 
     // ---- Pages ----
     .post('/pages', async ({ auth, body, request }: any) => {
