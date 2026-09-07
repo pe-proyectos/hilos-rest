@@ -30,7 +30,7 @@ export function createHilos(opts: HilosOptions) {
   return {
     health: () => req('GET', '/health'),
     pages: {
-      upsert: (p: { externalId?: string | number; handle?: string; type?: string; displayName?: string; avatarUrl?: string; bio?: string; parentHandle?: string; parentExternalId?: string | number; metadata?: any }): Promise<HilosPage> => req('POST', '/pages', p),
+      upsert: (p: { externalId?: string | number; handle?: string; type?: string; displayName?: string; avatarUrl?: string; bio?: string; parentHandle?: string; parentExternalId?: string | number; metadata?: any; createdAt?: string }): Promise<HilosPage> => req('POST', '/pages', p),
       get: (handle: string): Promise<HilosPage> => req('GET', `/pages/${encodeURIComponent(handle)}`),
       posts: (handle: string, page = 0, limit = 20): Promise<Paged<HilosPost>> => req('GET', `/pages/${encodeURIComponent(handle)}/posts?page=${page}&limit=${limit}`),
       follow: (handle: string, acting?: string | number): Promise<{ following: boolean }> => req('POST', `/pages/${encodeURIComponent(handle)}/follow`, undefined, acting),

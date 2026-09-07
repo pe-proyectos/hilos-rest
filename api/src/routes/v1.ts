@@ -78,6 +78,7 @@ export const v1 = () =>
           const upd = await prisma.page.update({ where: { id: existing.id }, data: {
             displayName: body.displayName ?? undefined, avatarUrl: body.avatarUrl ?? undefined, bio: body.bio ?? undefined,
             parentPageId: parentPageId ?? undefined, metadata: body.metadata ?? undefined,
+            createdAt: body.createdAt ? new Date(body.createdAt) : undefined,
           }, select: pageSel })
           return { data: shapePage(upd), created: false }
         }
@@ -86,9 +87,10 @@ export const v1 = () =>
       const page = await prisma.page.create({ data: {
         appId: auth.appId, handle, type, parentPageId, externalId: body.externalId ? String(body.externalId) : null,
         displayName: body.displayName ?? null, avatarUrl: body.avatarUrl ?? null, bio: body.bio ?? null, metadata: body.metadata ?? undefined,
+        createdAt: body.createdAt ? new Date(body.createdAt) : undefined,
       }, select: pageSel })
       return { data: shapePage(page), created: true }
-    }, { body: t.Object({ externalId: t.Optional(t.Union([t.String(), t.Number()])), handle: t.Optional(t.String()), type: t.Optional(t.String()), displayName: t.Optional(t.String()), avatarUrl: t.Optional(t.String()), bio: t.Optional(t.String()), parentHandle: t.Optional(t.String()), parentExternalId: t.Optional(t.Union([t.String(), t.Number()])), metadata: t.Optional(t.Any()) }) })
+    }, { body: t.Object({ externalId: t.Optional(t.Union([t.String(), t.Number()])), handle: t.Optional(t.String()), type: t.Optional(t.String()), displayName: t.Optional(t.String()), avatarUrl: t.Optional(t.String()), bio: t.Optional(t.String()), parentHandle: t.Optional(t.String()), parentExternalId: t.Optional(t.Union([t.String(), t.Number()])), metadata: t.Optional(t.Any()), createdAt: t.Optional(t.String()) }) })
 
     .get('/pages/:handle', async ({ auth, params }: any) => {
       if (!auth) return { error: 'unauthorized' }
