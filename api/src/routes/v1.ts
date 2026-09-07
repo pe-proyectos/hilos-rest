@@ -2,6 +2,8 @@ import { Elysia, t } from 'elysia'
 import { prisma } from '../lib/prisma'
 import { resolveAuth, actingPage, type AuthCtx } from '../plugins/auth'
 import { signJwt, generateApiKey } from '../lib/crypto'
+import { s3, R2_PUBLIC } from '../lib/s3'
+import { randomBytes } from 'crypto'
 
 const SECRET = process.env.HILOS_JWT_SECRET || 'dev-secret'
 const MAX_CONTENT = 8000
@@ -43,6 +45,17 @@ export const v1 = () =>
   new Elysia({ prefix: '/v1' })
     .derive(async ({ request }) => ({ auth: await resolveAuth(request.headers) as AuthCtx | null }))
     .get('/health', () => ({ ok: true, service: 'hilos.rest', version: '0.1.0' }))
+
+    // URL prefirmada para subir media (imagenes de posts/comentarios).
+    .post('/uploads', async ({ auth, body }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const c = s3(); if (!c) return { error: 'storage_not_configured' }
+      const name = String(body.filename || 'file').replace(/[^a-zA-Z0-9._-]/g, '_').slice(-60)
+      const ct = String(body.contentType || 'application/octet-stream')
+      const key = `${auth.appId}/media/${Date.now()}-${randomBytes(6).toString('hex')}-${name}`
+      const uploadUrl = c.presign(key, { method: 'PUT', expiresIn: 900, type: ct })
+      return { data: { uploadUrl, key, publicUrl: `${R2_PUBLIC}/${key}`, expiresIn: 900 } }
+    }, { body: t.Object({ filename: t.Optional(t.String()), contentType: t.Optional(t.String()) }) })
 
     // Bootstrap unico: crea el dev+app+keys si no existe ninguna app todavia.
     // Protegido por HILOS_BOOTSTRAP_TOKEN; inerte tras el primer uso.
