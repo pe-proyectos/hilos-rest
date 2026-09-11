@@ -46,6 +46,19 @@ export const v1 = () =>
     .derive(async ({ request }) => ({ auth: await resolveAuth(request.headers) as AuthCtx | null }))
     .get('/health', () => ({ ok: true, service: 'hilos.rest', version: '0.1.0' }))
 
+    // Admin: borra SOLO los comentarios del app (para re-migrar). Mantiene
+    // posts y pages.
+    .post('/admin/purge-comments', async ({ auth, request, body }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      if (!process.env.HILOS_BOOTSTRAP_TOKEN || request.headers.get('x-bootstrap-token') !== process.env.HILOS_BOOTSTRAP_TOKEN) return { error: 'forbidden' }
+      if (body?.confirm !== 'PURGE_COMMENTS') return { error: 'confirm_required' }
+      const before = await prisma.comment.count({ where: { appId: auth.appId } })
+      await prisma.comment.deleteMany({ where: { appId: auth.appId } })
+      await prisma.post.updateMany({ where: { appId: auth.appId }, data: { commentsCount: 0 } })
+      const after = await prisma.comment.count({ where: { appId: auth.appId } })
+      return { data: { before, after } }
+    }, { body: t.Object({ confirm: t.String() }) })
+
     // Config del App (origenes permitidos para page tokens). Admin.
     .post('/admin/app-config', async ({ auth, request, body }: any) => {
       if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
