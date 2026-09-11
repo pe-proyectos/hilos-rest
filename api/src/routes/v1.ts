@@ -198,11 +198,17 @@ export const v1 = () =>
       return { data: shapePage(updated), claimed: true }
     }, { body: t.Object({ fromExternalId: t.String(), toExternalId: t.String(), handle: t.Optional(t.String()), displayName: t.Optional(t.String()), avatarUrl: t.Optional(t.String()) }) })
 
-    .get('/pages/:handle', async ({ auth, params }: any) => {
+    .get('/pages/:handle', async ({ auth, params, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
       const page = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: params.handle } }, select: pageSel })
       if (!page) return { error: 'not_found' }
-      return { data: shapePage(page) }
+      let viewerFollows = false
+      const viewerPageId = auth.pageId ?? (await actingPage(auth, request.headers).catch(() => null))
+      if (viewerPageId && viewerPageId !== page.id) {
+        const f = await prisma.follow.findUnique({ where: { appId_followerPageId_followedPageId: { appId: auth.appId, followerPageId: viewerPageId, followedPageId: page.id } }, select: { id: true } })
+        viewerFollows = !!f
+      }
+      return { data: { ...shapePage(page), viewerFollows } }
     })
 
     // Mintea un page token (JWT app+page) desde el server del consumidor.
