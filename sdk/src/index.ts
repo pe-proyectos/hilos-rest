@@ -73,6 +73,7 @@ export function createHilos(opts: HilosOptions) {
       like: (id: number, acting?: string | number): Promise<{ liked: boolean; likesCount: number }> => req('POST', `/comments/${id}/like`, undefined, acting),
       hide: (id: number, hidden = true): Promise<{ id: number; hidden: boolean }> => req('POST', `/comments/${id}/hide`, { hidden }),
       edit: (id: number, content: string, acting?: string | number): Promise<HilosComment> => req('PATCH', `/comments/${id}`, { content }, acting),
+      byRef: (ref: string): Promise<{ id: number; content: string; postId: number }> => req('GET', `/comments/by-ref?ref=${encodeURIComponent(ref)}`),
     },
   }
 }

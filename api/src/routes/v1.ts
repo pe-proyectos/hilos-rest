@@ -1118,6 +1118,19 @@ export const v1 = () =>
     }, { body: t.Optional(t.Object({ hidden: t.Optional(t.Boolean()) })) })
 
     // Editar el propio comentario (o cualquiera desde el backend de la app).
+    // Localizar un comentario por la referencia de la app (para migraciones).
+    .get('/comments/by-ref', async ({ auth, query }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      const ref = String(query.ref || '')
+      if (!ref) return { error: 'bad_ref' }
+      const c = await prisma.comment.findUnique({
+        where: { appId_externalRef: { appId: auth.appId, externalRef: ref } },
+        select: { id: true, content: true, postId: true, deletedAt: true },
+      }).catch(() => null)
+      if (!c || c.deletedAt) return { error: 'not_found' }
+      return { data: { id: c.id, content: c.content, postId: c.postId } }
+    })
+
     .patch('/comments/:id', async ({ auth, params, body, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
       const c = await prisma.comment.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, select: { id: true, authorPageId: true } })
