@@ -65,6 +65,15 @@ async function notifyMentions(appId: number, content: string, actorPageId: numbe
   for (const p of pages) notify(appId, p.id, actorPageId, 'mention', { ...extra, preview: content })
 }
 
+// ¿Esta page está silenciada por el staff? (metadata.mutedUntil)
+async function isMuted(pageId: number): Promise<boolean> {
+  const p = await prisma.page.findUnique({ where: { id: pageId }, select: { metadata: true } }).catch(() => null)
+  const until = (p?.metadata as any)?.mutedUntil
+  if (!until) return false
+  if (until === 'forever') return true
+  return new Date(until) > new Date()
+}
+
 async function savedPosts(appId: number, pageId: number | null | undefined, postIds: number[]): Promise<Set<number>> {
   if (!pageId || !postIds.length) return new Set()
   const r = await prisma.save.findMany({ where: { appId, pageId, postId: { in: postIds } }, select: { postId: true } })
@@ -501,6 +510,7 @@ export const v1 = () =>
       let authorPageId: number
       try { authorPageId = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
       if (auth.mode === 'page' && !rateLimit(`post:${authorPageId}`, 10, 5 * 60_000)) return { error: 'rate_limited' }
+      if (auth.mode === 'page' && await isMuted(authorPageId)) return { error: 'muted' }
       const content = String(body.content || '').slice(0, MAX_CONTENT)
       if (!content.trim() && !body.media && !body.repostOfId) return { error: 'empty_post' }
       let wallPageId = authorPageId
@@ -880,6 +890,7 @@ export const v1 = () =>
       let authorPageId: number
       try { authorPageId = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
       if (auth.mode === 'page' && !rateLimit(`comment:${authorPageId}`, 30, 5 * 60_000)) return { error: 'rate_limited' }
+      if (auth.mode === 'page' && await isMuted(authorPageId)) return { error: 'muted' }
       const post = await prisma.post.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, select: { id: true } })
       if (!post) return { error: 'post_not_found' }
       const content = String(body.content || '').trim().slice(0, MAX_CONTENT)
@@ -953,6 +964,38 @@ export const v1 = () =>
       await prisma.comment.update({ where: { id }, data: { hiddenAt: hidden ? new Date() : null } })
       return { data: { id, hidden } }
     }, { body: t.Optional(t.Object({ hidden: t.Optional(t.Boolean()) })) })
+
+    // Editar el propio comentario (o cualquiera desde el backend de la app).
+    .patch('/comments/:id', async ({ auth, params, body, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const c = await prisma.comment.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, select: { id: true, authorPageId: true } })
+      if (!c) return { error: 'not_found' }
+      if (auth.mode !== 'secret') {
+        if (!requireScope(auth, 'comment:write')) return { error: 'insufficient_scope' }
+        let me: number
+        try { me = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+        if (me !== c.authorPageId) return { error: 'forbidden' }
+      }
+      const content = String(body.content || '').trim().slice(0, MAX_CONTENT)
+      if (!content) return { error: 'empty_comment' }
+      const up = await prisma.comment.update({ where: { id: c.id }, data: { content }, include: { author: { select: pageSel } } })
+      return { data: { id: up.id, content: up.content, parentCommentId: up.parentCommentId, likesCount: up.likesCount, createdAt: up.createdAt, author: shapePage(up.author) } }
+    }, { body: t.Object({ content: t.String() }) })
+
+    // Silenciar una page: deja de poder comentar y publicar. Reversible y solo
+    // desde el backend de la app, que es quien conoce los roles del staff.
+    .post('/pages/:handle/mute', async ({ auth, params, body }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      const page = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: String(params.handle).toLowerCase() } }, select: { id: true, metadata: true } })
+      if (!page) return { error: 'not_found' }
+      const muted = body?.muted === false ? false : true
+      const until = muted && body?.until ? new Date(body.until) : null
+      const meta: any = { ...(page.metadata as any ?? {}) }
+      if (muted) meta.mutedUntil = until ? until.toISOString() : 'forever'
+      else delete meta.mutedUntil
+      await prisma.page.update({ where: { id: page.id }, data: { metadata: meta } })
+      return { data: { handle: String(params.handle).toLowerCase(), muted, until: meta.mutedUntil ?? null } }
+    }, { body: t.Optional(t.Object({ muted: t.Optional(t.Boolean()), until: t.Optional(t.String()) })) })
 
     // ---- Reactions & Follows ----
     .post('/posts/:id/like', async ({ auth, params, request }: any) => {

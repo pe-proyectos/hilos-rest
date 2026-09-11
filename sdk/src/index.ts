@@ -36,6 +36,7 @@ export function createHilos(opts: HilosOptions) {
       claim: (p: { fromExternalId: string; toExternalId: string; handle?: string; displayName?: string; avatarUrl?: string }): Promise<HilosPage> => req('POST', '/pages/claim', p),
       update: (handle: string, p: { displayName?: string; bio?: string; avatarUrl?: string | null; bannerUrl?: string | null; handle?: string }, acting?: string | number): Promise<HilosPage> => req('PATCH', `/pages/${encodeURIComponent(handle)}`, p, acting),
       follow: (handle: string, acting?: string | number): Promise<{ following: boolean }> => req('POST', `/pages/${encodeURIComponent(handle)}/follow`, undefined, acting),
+      mute: (handle: string, muted = true, until?: string): Promise<{ handle: string; muted: boolean }> => req('POST', `/pages/${encodeURIComponent(handle)}/mute`, { muted, ...(until ? { until } : {}) }),
     },
     pageTokens: {
       create: (p: { pageId?: number; externalId?: string | number; ttl?: number; scopes?: string[]; origin?: string }): Promise<{ token: string; pageId: number; expiresIn: number; scopes?: string[] }> => req('POST', '/page-tokens', p),
@@ -59,12 +60,18 @@ export function createHilos(opts: HilosOptions) {
       send: (handle: string, content: string, acting?: string | number) => req('POST', '/messages', { handle, content }, acting),
       unread: (acting?: string | number) => req('GET', '/messages/unread', undefined, acting),
     },
+    notifications: {
+      list: (page = 0, limit = 20, acting?: string | number) => req('GET', `/notifications?page=${page}&limit=${limit}`, undefined, acting),
+      unread: (acting?: string | number) => req('GET', '/notifications/unread', undefined, acting),
+      read: (id?: number, acting?: string | number) => req('POST', '/notifications/read', id ? { id } : {}, acting),
+    },
     comments: {
       list: (postId: number): Promise<HilosComment[]> => req('GET', `/posts/${postId}/comments`),
       create: (postId: number, p: { content: string; parentCommentId?: number; parentExternalRef?: string; externalRef?: string; createdAt?: string }, acting?: string | number): Promise<HilosComment> => req('POST', `/posts/${postId}/comments`, p, acting),
       remove: (id: number, acting?: string | number): Promise<{ ok: boolean }> => req('DELETE', `/comments/${id}`, undefined, acting),
       like: (id: number, acting?: string | number): Promise<{ liked: boolean; likesCount: number }> => req('POST', `/comments/${id}/like`, undefined, acting),
       hide: (id: number, hidden = true): Promise<{ id: number; hidden: boolean }> => req('POST', `/comments/${id}/hide`, { hidden }),
+      edit: (id: number, content: string, acting?: string | number): Promise<HilosComment> => req('PATCH', `/comments/${id}`, { content }, acting),
     },
   }
 }
