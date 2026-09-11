@@ -239,6 +239,23 @@ export const v1 = () =>
       return { data: { revoked: true } }
     }, { body: t.Object({ jti: t.Optional(t.String()) }) })
 
+    // Sugerencias de pages a seguir (mas activas que el viewer aun no sigue).
+    .get('/pages/suggested', async ({ auth, query }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const limit = Math.min(10, Math.max(1, Number(query.limit) || 5))
+      let excludeIds: number[] = []
+      if (auth.pageId) {
+        const f = await prisma.follow.findMany({ where: { appId: auth.appId, followerPageId: auth.pageId }, select: { followedPageId: true } })
+        excludeIds = [...f.map((x) => x.followedPageId), auth.pageId]
+      }
+      const rows = await prisma.page.findMany({
+        where: { appId: auth.appId, ...(excludeIds.length ? { id: { notIn: excludeIds } } : {}), type: { in: ['scan', 'user'] }, postsCount: { gt: 0 } },
+        orderBy: [{ followersCount: 'desc' }, { postsCount: 'desc' }],
+        take: limit, select: pageSel,
+      })
+      return { data: rows.map(shapePage) }
+    })
+
     .get('/pages/:handle/posts', async ({ auth, params, query }: any) => {
       if (!auth) return { error: 'unauthorized' }
       const page = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: params.handle } }, select: { id: true } })
