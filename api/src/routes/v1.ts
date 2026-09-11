@@ -114,6 +114,38 @@ function commentOrder(sort: SortKey): any[] {
   }
 }
 
+// Vistazo rápido a la conversación de cada post: las últimas respuestas y las
+// que más han gustado, sin repetir ninguna.
+async function attachReplies(appId: number, shaped: any[], ids: number[]) {
+  if (!ids.length) return
+  const rows = await prisma.$queryRaw<any[]>`
+    SELECT id, "postId", content, "createdAt", "authorPageId", "likesCount" FROM (
+      SELECT c.id, c."postId", c.content, c."createdAt", c."authorPageId", c."likesCount",
+             ROW_NUMBER() OVER (PARTITION BY c."postId" ORDER BY c."createdAt" DESC) AS rn_new,
+             ROW_NUMBER() OVER (PARTITION BY c."postId" ORDER BY c."likesCount" DESC, c."createdAt" DESC) AS rn_top
+      FROM comment c
+      WHERE c."postId" = ANY(${ids}::int[]) AND c."deletedAt" IS NULL AND c."hiddenAt" IS NULL
+    ) t WHERE t.rn_new <= 3 OR t.rn_top <= 3`
+
+  const authorIds = [...new Set(rows.map((r) => r.authorPageId))]
+  const authors = authorIds.length ? await prisma.page.findMany({ where: { id: { in: authorIds } }, select: pageSel }) : []
+  const byPage = new Map(authors.map((a) => [a.id, a]))
+
+  const byPost = new Map<number, any[]>()
+  for (const r of rows) {
+    const list = byPost.get(r.postId) || []
+    // La consulta puede devolver la misma fila por las dos vías.
+    if (!list.some((x) => x.id === r.id)) {
+      list.push({ id: r.id, content: r.content, createdAt: r.createdAt, likesCount: r.likesCount, author: shapePage(byPage.get(r.authorPageId)) })
+    }
+    byPost.set(r.postId, list)
+  }
+  for (const [, list] of byPost) {
+    list.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+  }
+  for (const p of shaped) p.recentComments = byPost.get(p.id) || []
+}
+
 async function savedPosts(appId: number, pageId: number | null | undefined, postIds: number[]): Promise<Set<number>> {
   if (!pageId || !postIds.length) return new Set()
   const r = await prisma.save.findMany({ where: { appId, pageId, postId: { in: postIds } }, select: { postId: true } })
@@ -543,7 +575,9 @@ export const v1 = () =>
       const ids = items.map((p) => p.id)
       const viewer = await viewerPage(auth, request.headers)
       const [likes, saves] = await Promise.all([likedPosts(auth.appId, viewer, ids), savedPosts(auth.appId, viewer, ids)])
-      return { data: { items: items.map((p) => shapePost(p, likes, saves)), hasMore: has } }
+      const shaped = items.map((p) => shapePost(p, likes, saves))
+      if (query.replies === '1' || query.replies === 'true') await attachReplies(auth.appId, shaped, ids)
+      return { data: { items: shaped, hasMore: has } }
     })
 
     // ---- Posts ----
@@ -681,28 +715,7 @@ export const v1 = () =>
       const [likes, saves] = await Promise.all([likedPosts(auth.appId, viewer, ids), savedPosts(auth.appId, viewer, ids)])
       const shaped = items.map((p) => shapePost(p, likes, saves))
 
-      // Vistazo rapido: las ultimas respuestas de cada post, sin abrirlo.
-      if (withReplies && ids.length) {
-        const recent = await prisma.$queryRaw<any[]>`
-          SELECT * FROM (
-            SELECT c.id, c."postId", c.content, c."createdAt", c."authorPageId",
-                   ROW_NUMBER() OVER (PARTITION BY c."postId" ORDER BY c."createdAt" DESC) AS rn
-            FROM comment c
-            WHERE c."postId" = ANY(${ids}::int[]) AND c."deletedAt" IS NULL AND c."hiddenAt" IS NULL
-          ) t WHERE t.rn <= 2`
-        const authorIds = [...new Set(recent.map((r) => r.authorPageId))]
-        const authors = authorIds.length
-          ? await prisma.page.findMany({ where: { id: { in: authorIds } }, select: pageSel })
-          : []
-        const byPage = new Map(authors.map((a) => [a.id, a]))
-        const byPost = new Map<number, any[]>()
-        for (const r of recent.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())) {
-          const list = byPost.get(r.postId) || []
-          list.push({ id: r.id, content: r.content, createdAt: r.createdAt, author: shapePage(byPage.get(r.authorPageId)) })
-          byPost.set(r.postId, list)
-        }
-        for (const p of shaped) (p as any).recentComments = byPost.get(p.id) || []
-      }
+      if (withReplies) await attachReplies(auth.appId, shaped, ids)
 
       return { data: { items: shaped, hasMore: has } }
     })
