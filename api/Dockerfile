@@ -8,4 +8,4 @@ RUN bunx prisma generate
 COPY . .
 EXPOSE 3100
 # En arranque sincroniza el esquema (idempotente en greenfield) y levanta el server.
-CMD ["sh", "-c", "bunx prisma db push --skip-generate && bun src/index.ts"]
+CMD ["sh", "-c", "bunx prisma db push --skip-generate --accept-data-loss && bun src/index.ts"]
