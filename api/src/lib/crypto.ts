@@ -20,7 +20,12 @@ const fromB64url = (s: string) => Buffer.from(s.replace(/-/g, '+').replace(/_/g,
 export function signJwt(payload: Record<string, any>, secret: string, ttlSeconds = 3600): string {
   const header = b64url(Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })))
   const now = Math.floor(Date.now() / 1000)
-  const body = b64url(Buffer.from(JSON.stringify({ ...payload, iat: now, exp: now + ttlSeconds })))
+  const body = b64url(Buffer.from(JSON.stringify({
+    iss: 'https://hilos.rest',
+    jti: randomBytes(12).toString('hex'),
+    ...payload,
+    iat: now, nbf: now, exp: now + ttlSeconds,
+  })))
   const data = `${header}.${body}`
   const sig = b64url(createHmac('sha256', secret).update(data).digest())
   return `${data}.${sig}`

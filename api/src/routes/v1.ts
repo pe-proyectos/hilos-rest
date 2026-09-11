@@ -1,6 +1,6 @@
 import { Elysia, t } from 'elysia'
 import { prisma } from '../lib/prisma'
-import { resolveAuth, actingPage, type AuthCtx } from '../plugins/auth'
+import { resolveAuth, actingPage, requireScope, rateLimit, CLIENT_SCOPES, type AuthCtx } from '../plugins/auth'
 import { signJwt, generateApiKey } from '../lib/crypto'
 import { s3, R2_PUBLIC } from '../lib/s3'
 import { randomBytes } from 'crypto'
@@ -146,9 +146,26 @@ export const v1 = () =>
       if (body.pageId) { const p = await prisma.page.findFirst({ where: { id: Number(body.pageId), appId: auth.appId }, select: { id: true } }); pageId = p?.id ?? null }
       else if (body.externalId) { const p = await prisma.page.findUnique({ where: { appId_externalId: { appId: auth.appId, externalId: String(body.externalId) } }, select: { id: true } }); pageId = p?.id ?? null }
       if (!pageId) return { error: 'page_not_found' }
-      const ttl = Math.min(86400, Math.max(60, Number(body.ttl) || 3600))
-      return { data: { token: signJwt({ t: 'page', appId: auth.appId, pageId }, SECRET, ttl), pageId, expiresIn: ttl } }
-    }, { body: t.Object({ pageId: t.Optional(t.Union([t.String(), t.Number()])), externalId: t.Optional(t.Union([t.String(), t.Number()])), ttl: t.Optional(t.Number()) }) })
+      // TTL corto por defecto (15 min): el cliente renueva desde su backend.
+      const ttl = Math.min(3600, Math.max(60, Number(body.ttl) || 900))
+      const scopes = Array.isArray(body.scopes) && body.scopes.length
+        ? body.scopes.filter((x: string) => (CLIENT_SCOPES as string[]).includes(x))
+        : ['read', 'post:write', 'comment:write', 'react', 'follow']
+      const aud = body.origin ? String(body.origin) : undefined
+      const token = signJwt({ t: 'page', appId: auth.appId, pageId, sub: `page:${pageId}`, scope: scopes.join(' '), ...(aud ? { aud } : {}) }, SECRET, ttl)
+      return { data: { token, pageId, expiresIn: ttl, scopes } }
+    }, { body: t.Object({ pageId: t.Optional(t.Union([t.String(), t.Number()])), externalId: t.Optional(t.Union([t.String(), t.Number()])), ttl: t.Optional(t.Number()), scopes: t.Optional(t.Array(t.String())), origin: t.Optional(t.String()) }) })
+
+    .post('/page-tokens/revoke', async ({ auth, body }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const jti = String(body.jti || auth.jti || '')
+      if (!jti) return { error: 'missing_jti' }
+      await prisma.revokedToken.upsert({
+        where: { jti }, update: {},
+        create: { jti, expiresAt: new Date(Date.now() + 3600_000) },
+      }).catch(() => {})
+      return { data: { revoked: true } }
+    }, { body: t.Object({ jti: t.Optional(t.String()) }) })
 
     .get('/pages/:handle/posts', async ({ auth, params, query }: any) => {
       if (!auth) return { error: 'unauthorized' }
@@ -164,8 +181,10 @@ export const v1 = () =>
     // ---- Posts ----
     .post('/posts', async ({ auth, body, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
+      if (!requireScope(auth, 'post:write')) return { error: 'insufficient_scope' }
       let authorPageId: number
       try { authorPageId = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+      if (auth.mode === 'page' && !rateLimit(`post:${authorPageId}`, 10, 5 * 60_000)) return { error: 'rate_limited' }
       const content = String(body.content || '').slice(0, MAX_CONTENT)
       if (!content.trim() && !body.media && !body.repostOfId) return { error: 'empty_post' }
       let wallPageId = authorPageId
@@ -235,8 +254,10 @@ export const v1 = () =>
     })
     .post('/posts/:id/comments', async ({ auth, params, body, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
+      if (!requireScope(auth, 'comment:write')) return { error: 'insufficient_scope' }
       let authorPageId: number
       try { authorPageId = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+      if (auth.mode === 'page' && !rateLimit(`comment:${authorPageId}`, 30, 5 * 60_000)) return { error: 'rate_limited' }
       const post = await prisma.post.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, select: { id: true } })
       if (!post) return { error: 'post_not_found' }
       const content = String(body.content || '').trim().slice(0, MAX_CONTENT)
@@ -258,8 +279,10 @@ export const v1 = () =>
     // ---- Reactions & Follows ----
     .post('/posts/:id/like', async ({ auth, params, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
+      if (!requireScope(auth, 'react')) return { error: 'insufficient_scope' }
       let pageId: number
       try { pageId = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+      if (auth.mode === 'page' && !rateLimit(`like:${pageId}`, 120, 60_000)) return { error: 'rate_limited' }
       const id = Number(params.id)
       const existing = await prisma.reaction.findUnique({ where: { appId_targetType_targetId_pageId_type: { appId: auth.appId, targetType: 'post', targetId: id, pageId, type: 'like' } } })
       if (existing) {
@@ -273,6 +296,7 @@ export const v1 = () =>
     })
     .post('/pages/:handle/follow', async ({ auth, params, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
+      if (!requireScope(auth, 'follow')) return { error: 'insufficient_scope' }
       let followerPageId: number
       try { followerPageId = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
       const target = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: params.handle } }, select: { id: true } })

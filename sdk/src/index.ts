@@ -36,7 +36,7 @@ export function createHilos(opts: HilosOptions) {
       follow: (handle: string, acting?: string | number): Promise<{ following: boolean }> => req('POST', `/pages/${encodeURIComponent(handle)}/follow`, undefined, acting),
     },
     pageTokens: {
-      create: (p: { pageId?: number; externalId?: string | number; ttl?: number }): Promise<{ token: string; pageId: number; expiresIn: number }> => req('POST', '/page-tokens', p),
+      create: (p: { pageId?: number; externalId?: string | number; ttl?: number; scopes?: string[]; origin?: string }): Promise<{ token: string; pageId: number; expiresIn: number; scopes?: string[] }> => req('POST', '/page-tokens', p),
     },
     posts: {
       create: (p: { content?: string; media?: any; wallHandle?: string; wallExternalId?: string | number; wallPageId?: number; repostOfId?: number; externalRef?: string; metadata?: any; createdAt?: string }, acting?: string | number): Promise<HilosPost> => req('POST', '/posts', p, acting),

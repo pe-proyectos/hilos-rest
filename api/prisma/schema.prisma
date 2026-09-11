@@ -22,10 +22,11 @@ model Developer {
 
 // Un App = un tenant social. Puede emitir varias API keys (una por consumidor).
 model App {
-  id          Int      @id @default(autoincrement())
-  developerId Int
-  name        String   @db.VarChar(120)
-  slug        String   @unique @db.VarChar(120)
+  id             Int      @id @default(autoincrement())
+  developerId    Int
+  name           String   @db.VarChar(120)
+  slug           String   @unique @db.VarChar(120)
+  allowedOrigins String?  @db.VarChar(1000)
   createdAt   DateTime @default(now()) @db.Timestamp(6)
   developer   Developer @relation(fields: [developerId], references: [id], onDelete: Cascade)
   keys        ApiKey[]
@@ -178,3 +179,15 @@ model Hashtag {
   @@index([postId])
   @@map("hashtag")
 }
+
+// Tokens revocados (logout / rotacion). Se purgan tras expirar.
+model RevokedToken {
+  id        Int      @id @default(autoincrement())
+  jti       String   @unique @db.VarChar(64)
+  expiresAt DateTime @db.Timestamp(6)
+  createdAt DateTime @default(now()) @db.Timestamp(6)
+
+  @@index([expiresAt])
+  @@map("revoked_token")
+}
+
