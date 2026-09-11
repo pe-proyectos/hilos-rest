@@ -22,7 +22,12 @@ async function uniqueHandle(appId: number, base: string): Promise<string> {
 }
 function parseHashtags(c: string): string[] {
   const out = new Set<string>()
-  for (const m of c.matchAll(/#([\p{L}\p{N}_]{1,80})/gu)) out.add(m[1].toLowerCase())
+  for (const m of c.matchAll(/#([\p{L}\p{N}_]{1,80})/gu)) {
+    const tag = m[1].toLowerCase()
+    // Los titulos de capitulo traen "#90.5": un numero suelto no es una tendencia.
+    if (/^\d+$/.test(tag)) continue
+    out.add(tag)
+  }
   return [...out].slice(0, 12)
 }
 const pageSel = { id: true, handle: true, type: true, parentPageId: true, externalId: true, displayName: true, avatarUrl: true, bio: true, followersCount: true, followingCount: true, postsCount: true }
@@ -253,19 +258,25 @@ export const v1 = () =>
       if (!auth) return { error: 'unauthorized' }
       const limit = Math.min(20, Number(query.limit) || 8)
       const since = new Date(Date.now() - 7 * 24 * 3600 * 1000)
+      const isNoise = (t: string) => /^\d+$/.test(t)
+      const over = limit * 6
       const rows = await prisma.hashtag.groupBy({
         by: ['tag'],
         where: { appId: auth.appId, createdAt: { gte: since } },
         _count: { tag: true },
         orderBy: { _count: { tag: 'desc' } },
-        take: limit,
+        take: over,
       })
+      let src = rows.filter((r: any) => !isNoise(r.tag))
       // Si la ventana de 7 dias esta vacia (contenido historico migrado), caemos a todo el historico.
-      const src = rows.length ? rows : await prisma.hashtag.groupBy({
-        by: ['tag'], where: { appId: auth.appId }, _count: { tag: true },
-        orderBy: { _count: { tag: 'desc' } }, take: limit,
-      })
-      return { data: src.map((r: any) => ({ tag: r.tag, count: r._count.tag })) }
+      if (!src.length) {
+        const all = await prisma.hashtag.groupBy({
+          by: ['tag'], where: { appId: auth.appId }, _count: { tag: true },
+          orderBy: { _count: { tag: 'desc' } }, take: over,
+        })
+        src = all.filter((r: any) => !isNoise(r.tag))
+      }
+      return { data: src.slice(0, limit).map((r: any) => ({ tag: r.tag, count: r._count.tag })) }
     })
 
     // Busqueda unificada: pages por handle/nombre + posts por contenido.
