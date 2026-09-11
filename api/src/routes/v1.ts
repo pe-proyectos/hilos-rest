@@ -82,6 +82,26 @@ export const v1 = () =>
       return { data: { purged: true, before, after } }
     }, { body: t.Object({ confirm: t.String() }) })
 
+    // Ingesta de media por URL (migracion opcion B): descarga y guarda en el R2
+    // de hilos. Devuelve la URL publica propia.
+    .post('/uploads/fetch', async ({ auth, body }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      const c = s3(); if (!c) return { error: 'storage_not_configured' }
+      const src = String(body.url || '')
+      if (!/^https?:\/\//i.test(src)) return { error: 'invalid_url' }
+      try {
+        const res = await fetch(src)
+        if (!res.ok) return { error: 'fetch_failed' }
+        const ct = res.headers.get('content-type') || 'application/octet-stream'
+        const buf = new Uint8Array(await res.arrayBuffer())
+        if (buf.byteLength > 15 * 1024 * 1024) return { error: 'too_large' }
+        const name = (src.split('/').pop() || 'file').split('?')[0].replace(/[^a-zA-Z0-9._-]/g, '_').slice(-60)
+        const key = `${auth.appId}/media/${randomBytes(6).toString('hex')}-${name}`
+        await c.write(key, buf, { type: ct })
+        return { data: { key, publicUrl: `${R2_PUBLIC}/${key}` } }
+      } catch (e: any) { return { error: 'fetch_failed' } }
+    }, { body: t.Object({ url: t.String() }) })
+
     // URL prefirmada para subir media (imagenes de posts/comentarios).
     .post('/uploads', async ({ auth, body }: any) => {
       if (!auth) return { error: 'unauthorized' }
@@ -140,6 +160,30 @@ export const v1 = () =>
       }, select: pageSel })
       return { data: shapePage(page), created: true }
     }, { body: t.Object({ externalId: t.Optional(t.Union([t.String(), t.Number()])), handle: t.Optional(t.String()), type: t.Optional(t.String()), displayName: t.Optional(t.String()), avatarUrl: t.Optional(t.String()), bio: t.Optional(t.String()), parentHandle: t.Optional(t.String()), parentExternalId: t.Optional(t.Union([t.String(), t.Number()])), metadata: t.Optional(t.Any()), createdAt: t.Optional(t.String()) }) })
+
+    // Reclamo de page: re-asigna el externalId de una page existente (p.ej. una
+    // page migrada 'capibara:user:5' pasa a 'lacharca:user:12'). Solo secret key.
+    .post('/pages/claim', async ({ auth, body }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      const from = String(body.fromExternalId || '')
+      const to = String(body.toExternalId || '')
+      if (!from || !to) return { error: 'missing_ids' }
+      const page = await prisma.page.findUnique({ where: { appId_externalId: { appId: auth.appId, externalId: from } }, select: { id: true } })
+      if (!page) return { error: 'not_found' }
+      const taken = await prisma.page.findUnique({ where: { appId_externalId: { appId: auth.appId, externalId: to } }, select: { id: true } })
+      if (taken && taken.id !== page.id) return { error: 'target_exists' }
+      const updated = await prisma.page.update({
+        where: { id: page.id },
+        data: {
+          externalId: to,
+          handle: body.handle ? String(body.handle) : undefined,
+          displayName: body.displayName ?? undefined,
+          avatarUrl: body.avatarUrl ?? undefined,
+        },
+        select: pageSel,
+      })
+      return { data: shapePage(updated), claimed: true }
+    }, { body: t.Object({ fromExternalId: t.String(), toExternalId: t.String(), handle: t.Optional(t.String()), displayName: t.Optional(t.String()), avatarUrl: t.Optional(t.String()) }) })
 
     .get('/pages/:handle', async ({ auth, params }: any) => {
       if (!auth) return { error: 'unauthorized' }
@@ -219,6 +263,16 @@ export const v1 = () =>
       await prisma.page.update({ where: { id: authorPageId }, data: { postsCount: { increment: 1 } } }).catch(() => {})
       return { data: shapePost(post) }
     }, { body: t.Object({ content: t.Optional(t.String()), media: t.Optional(t.Any()), wallHandle: t.Optional(t.String()), wallExternalId: t.Optional(t.Union([t.String(), t.Number()])), wallPageId: t.Optional(t.Union([t.String(), t.Number()])), repostOfId: t.Optional(t.Union([t.String(), t.Number()])), externalRef: t.Optional(t.String()), metadata: t.Optional(t.Any()), createdAt: t.Optional(t.String()) }) })
+
+    // Buscar post por su externalRef (p.ej. 'chapter:123'). Util en migraciones.
+    .get('/posts/by-ref', async ({ auth, query }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const ref = String(query.ref || '')
+      if (!ref) return { error: 'missing_ref' }
+      const p = await prisma.post.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef: ref } }, select: { id: true, wallPageId: true } })
+      if (!p) return { error: 'not_found' }
+      return { data: p }
+    })
 
     .get('/posts/:id', async ({ auth, params }: any) => {
       if (!auth) return { error: 'unauthorized' }

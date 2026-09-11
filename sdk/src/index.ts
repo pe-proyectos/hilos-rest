@@ -33,6 +33,7 @@ export function createHilos(opts: HilosOptions) {
       upsert: (p: { externalId?: string | number; handle?: string; type?: string; displayName?: string; avatarUrl?: string; bio?: string; parentHandle?: string; parentExternalId?: string | number; metadata?: any; createdAt?: string }): Promise<HilosPage> => req('POST', '/pages', p),
       get: (handle: string): Promise<HilosPage> => req('GET', `/pages/${encodeURIComponent(handle)}`),
       posts: (handle: string, page = 0, limit = 20): Promise<Paged<HilosPost>> => req('GET', `/pages/${encodeURIComponent(handle)}/posts?page=${page}&limit=${limit}`),
+      claim: (p: { fromExternalId: string; toExternalId: string; handle?: string; displayName?: string; avatarUrl?: string }): Promise<HilosPage> => req('POST', '/pages/claim', p),
       follow: (handle: string, acting?: string | number): Promise<{ following: boolean }> => req('POST', `/pages/${encodeURIComponent(handle)}/follow`, undefined, acting),
     },
     pageTokens: {
@@ -41,8 +42,12 @@ export function createHilos(opts: HilosOptions) {
     posts: {
       create: (p: { content?: string; media?: any; wallHandle?: string; wallExternalId?: string | number; wallPageId?: number; repostOfId?: number; externalRef?: string; metadata?: any; createdAt?: string }, acting?: string | number): Promise<HilosPost> => req('POST', '/posts', p, acting),
       get: (id: number): Promise<HilosPost> => req('GET', `/posts/${id}`),
+      byRef: (ref: string): Promise<{ id: number; wallPageId: number }> => req('GET', `/posts/by-ref?ref=${encodeURIComponent(ref)}`),
       remove: (id: number, acting?: string | number): Promise<{ ok: boolean }> => req('DELETE', `/posts/${id}`, undefined, acting),
       like: (id: number, acting?: string | number): Promise<{ liked: boolean; likesCount: number }> => req('POST', `/posts/${id}/like`, undefined, acting),
+    },
+    uploads: {
+      fromUrl: (url: string): Promise<{ key: string; publicUrl: string }> => req('POST', '/uploads/fetch', { url }),
     },
     feed: (opt: { scope?: 'following' | 'foryou'; page?: number; limit?: number } = {}): Promise<Paged<HilosPost>> => req('GET', `/feed?scope=${opt.scope || 'foryou'}&page=${opt.page || 0}&limit=${opt.limit || 20}`),
     comments: {
