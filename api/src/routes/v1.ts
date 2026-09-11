@@ -338,7 +338,18 @@ export const v1 = () =>
       if (!post) return { error: 'post_not_found' }
       const content = String(body.content || '').trim().slice(0, MAX_CONTENT)
       if (!content) return { error: 'empty_comment' }
-      const c = await prisma.comment.create({ data: { appId: auth.appId, postId: post.id, authorPageId, parentCommentId: body.parentCommentId ? Number(body.parentCommentId) : null, content, createdAt: body.createdAt ? new Date(body.createdAt) : undefined }, include: { author: { select: pageSel } } })
+      // Dedupe por externalRef (migraciones idempotentes).
+      if (body.externalRef) {
+        const dup = await prisma.comment.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef: String(body.externalRef) } }, include: { author: { select: pageSel } } }).catch(() => null)
+        if (dup) return { data: { id: dup.id, content: dup.content, parentCommentId: dup.parentCommentId, likesCount: dup.likesCount, createdAt: dup.createdAt, author: shapePage(dup.author) }, deduped: true }
+      }
+      // El padre puede venir por id propio o por su externalRef original.
+      let parentCommentId: number | null = body.parentCommentId ? Number(body.parentCommentId) : null
+      if (!parentCommentId && body.parentExternalRef) {
+        const p = await prisma.comment.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef: String(body.parentExternalRef) } }, select: { id: true } }).catch(() => null)
+        parentCommentId = p?.id ?? null
+      }
+      const c = await prisma.comment.create({ data: { appId: auth.appId, postId: post.id, authorPageId, parentCommentId, externalRef: body.externalRef ? String(body.externalRef) : null, content, createdAt: body.createdAt ? new Date(body.createdAt) : undefined }, include: { author: { select: pageSel } } })
       await prisma.post.update({ where: { id: post.id }, data: { commentsCount: { increment: 1 } } })
       return { data: { id: c.id, content: c.content, parentCommentId: c.parentCommentId, likesCount: 0, createdAt: c.createdAt, author: shapePage(c.author) } }
     }, { body: t.Object({ content: t.String(), parentCommentId: t.Optional(t.Union([t.String(), t.Number()])), parentExternalRef: t.Optional(t.String()), externalRef: t.Optional(t.String()), createdAt: t.Optional(t.String()) }) })
