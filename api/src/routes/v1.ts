@@ -240,6 +240,25 @@ export const v1 = () =>
     }, { body: t.Object({ jti: t.Optional(t.String()) }) })
 
     // Sugerencias de pages a seguir (mas activas que el viewer aun no sigue).
+    // Directorio paginado de pages (scroll infinito en Explorar).
+    .get('/pages/directory', async ({ auth, query }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const limit = Math.min(48, Math.max(1, Number(query.limit) || 24))
+      const page = Math.max(0, Number(query.page) || 0)
+      const type = String(query.type || '')
+      const q = String(query.q || '').trim()
+      const types = type === 'user' ? ['user'] : type === 'scan' ? ['scan'] : ['scan', 'user']
+      const where: any = { appId: auth.appId, type: { in: types } }
+      if (q) where.OR = [{ displayName: { contains: q, mode: 'insensitive' } }, { handle: { contains: q.toLowerCase() } }]
+      const rows = await prisma.page.findMany({
+        where,
+        orderBy: [{ postsCount: 'desc' }, { followersCount: 'desc' }, { id: 'asc' }],
+        skip: page * limit, take: limit + 1, select: pageSel,
+      })
+      const hasMore = rows.length > limit
+      return { data: { items: rows.slice(0, limit).map(shapePage), hasMore } }
+    })
+
     .get('/pages/suggested', async ({ auth, query }: any) => {
       if (!auth) return { error: 'unauthorized' }
       const limit = Math.min(10, Math.max(1, Number(query.limit) || 5))
