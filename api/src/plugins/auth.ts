@@ -87,3 +87,8 @@ export function rateLimit(key: string, max: number, windowMs: number): boolean {
   b.n++
   return true
 }
+
+// Page del espectador para banderas (liked/saved): igual que actingPage pero sin lanzar.
+export async function viewerPage(auth: AuthCtx, headers: Headers): Promise<number | null> {
+  try { return await actingPage(auth, headers) } catch { return null }
+}

@@ -1,6 +1,6 @@
 import { Elysia, t } from 'elysia'
 import { prisma } from '../lib/prisma'
-import { resolveAuth, actingPage, requireScope, rateLimit, CLIENT_SCOPES, type AuthCtx } from '../plugins/auth'
+import { resolveAuth, actingPage, viewerPage, requireScope, rateLimit, CLIENT_SCOPES, type AuthCtx } from '../plugins/auth'
 import { signJwt, generateApiKey } from '../lib/crypto'
 import { s3, R2_PUBLIC } from '../lib/s3'
 import { randomBytes } from 'crypto'
@@ -302,7 +302,7 @@ export const v1 = () =>
       return { data: pages.map(shapePage) }
     })
 
-    .get('/pages/:handle/posts', async ({ auth, params, query }: any) => {
+    .get('/pages/:handle/posts', async ({ auth, params, query, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
       const page = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: params.handle } }, select: { id: true } })
       if (!page) return { error: 'not_found' }
@@ -317,7 +317,8 @@ export const v1 = () =>
       const rows = await prisma.post.findMany({ where, orderBy: [{ pinned: 'desc' }, { createdAt: 'desc' }], skip: pg * limit, take: limit + 1, include: { author: { select: pageSel } } })
       const has = rows.length > limit, items = rows.slice(0, limit)
       const ids = items.map((p) => p.id)
-      const [likes, saves] = await Promise.all([likedPosts(auth.appId, auth.pageId, ids), savedPosts(auth.appId, auth.pageId, ids)])
+      const viewer = await viewerPage(auth, request.headers)
+      const [likes, saves] = await Promise.all([likedPosts(auth.appId, viewer, ids), savedPosts(auth.appId, viewer, ids)])
       return { data: { items: items.map((p) => shapePost(p, likes, saves)), hasMore: has } }
     })
 
@@ -364,11 +365,12 @@ export const v1 = () =>
       return { data: p }
     })
 
-    .get('/posts/:id', async ({ auth, params }: any) => {
+    .get('/posts/:id', async ({ auth, params, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
       const p = await prisma.post.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, include: { author: { select: pageSel } } })
       if (!p) return { error: 'not_found' }
-      const [likes, saves] = await Promise.all([likedPosts(auth.appId, auth.pageId, [p.id]), savedPosts(auth.appId, auth.pageId, [p.id])])
+      const viewer = await viewerPage(auth, request.headers)
+      const [likes, saves] = await Promise.all([likedPosts(auth.appId, viewer, [p.id]), savedPosts(auth.appId, viewer, [p.id])])
       return { data: shapePost(p, likes, saves) }
     })
 
@@ -384,7 +386,7 @@ export const v1 = () =>
     })
 
     // Feed: timeline de las pages que sigue la page actuante (o global reciente).
-    .get('/feed', async ({ auth, query }: any) => {
+    .get('/feed', async ({ auth, query, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
       const limit = Math.min(50, Math.max(1, Number(query.limit) || 20)), pg = Math.max(0, Number(query.page) || 0)
       const where: any = { appId: auth.appId, deletedAt: null, hiddenAt: null }
@@ -396,7 +398,8 @@ export const v1 = () =>
       const rows = await prisma.post.findMany({ where, orderBy: [{ createdAt: 'desc' }], skip: pg * limit, take: limit + 1, include: { author: { select: pageSel } } })
       const has = rows.length > limit, items = rows.slice(0, limit)
       const ids = items.map((p) => p.id)
-      const [likes, saves] = await Promise.all([likedPosts(auth.appId, auth.pageId, ids), savedPosts(auth.appId, auth.pageId, ids)])
+      const viewer = await viewerPage(auth, request.headers)
+      const [likes, saves] = await Promise.all([likedPosts(auth.appId, viewer, ids), savedPosts(auth.appId, viewer, ids)])
       return { data: { items: items.map((p) => shapePost(p, likes, saves)), hasMore: has } }
     })
 
