@@ -46,6 +46,15 @@ export const v1 = () =>
     .derive(async ({ request }) => ({ auth: await resolveAuth(request.headers) as AuthCtx | null }))
     .get('/health', () => ({ ok: true, service: 'hilos.rest', version: '0.1.0' }))
 
+    // Config del App (origenes permitidos para page tokens). Admin.
+    .post('/admin/app-config', async ({ auth, request, body }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      if (!process.env.HILOS_BOOTSTRAP_TOKEN || request.headers.get('x-bootstrap-token') !== process.env.HILOS_BOOTSTRAP_TOKEN) return { error: 'forbidden' }
+      const origins = String(body.allowedOrigins || '').split(',').map((x: string) => x.trim()).filter(Boolean).join(',')
+      const app = await prisma.app.update({ where: { id: auth.appId }, data: { allowedOrigins: origins || null }, select: { id: true, slug: true, allowedOrigins: true } })
+      return { data: app }
+    }, { body: t.Object({ allowedOrigins: t.String() }) })
+
     // Purga de contenido de la app (mantiene app y API keys). Protegido por
     // HILOS_BOOTSTRAP_TOKEN + confirmacion explicita. Uso administrativo.
     .post('/admin/purge', async ({ auth, request, body }: any) => {
