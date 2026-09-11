@@ -509,10 +509,30 @@ export const v1 = () =>
     })
 
     // ---- Comments ----
-    .get('/posts/:id/comments', async ({ auth, params }: any) => {
+    .get('/posts/:id/comments', async ({ auth, params, query }: any) => {
       if (!auth) return { error: 'unauthorized' }
-      const rows = await prisma.comment.findMany({ where: { appId: auth.appId, postId: Number(params.id), deletedAt: null, hiddenAt: null }, orderBy: { createdAt: 'asc' }, take: 200, include: { author: { select: pageSel } } })
-      return { data: rows.map((c) => ({ id: c.id, content: c.content, parentCommentId: c.parentCommentId, likesCount: c.likesCount, createdAt: c.createdAt, author: shapePage(c.author) })) }
+      const postId = Number(params.id)
+      const where = { appId: auth.appId, postId, deletedAt: null, hiddenAt: null }
+      // Paginado: un capitulo popular pasa de 300 comentarios y antes se cortaban.
+      const paged = query.page !== undefined || query.limit !== undefined
+      const limit = Math.min(200, Math.max(1, Number(query.limit) || 100))
+      const pg = Math.max(0, Number(query.page) || 0)
+      const rows = await prisma.comment.findMany({
+        where,
+        orderBy: { createdAt: 'asc' },
+        skip: paged ? pg * limit : 0,
+        take: paged ? limit + 1 : 200,
+        include: { author: { select: pageSel } },
+      })
+      const hasMore = paged && rows.length > limit
+      const items = (paged ? rows.slice(0, limit) : rows).map((c) => ({
+        id: c.id, content: c.content, parentCommentId: c.parentCommentId,
+        likesCount: c.likesCount, createdAt: c.createdAt, author: shapePage(c.author),
+      }))
+      // Sin parametros mantenemos la forma antigua (array) por compatibilidad.
+      if (!paged) return { data: items }
+      const total = await prisma.comment.count({ where })
+      return { data: { items, hasMore, total } }
     })
     .post('/posts/:id/comments', async ({ auth, params, body, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
