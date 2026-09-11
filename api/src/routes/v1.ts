@@ -246,6 +246,76 @@ export const v1 = () =>
 
     // Sugerencias de pages a seguir (mas activas que el viewer aun no sigue).
     // Directorio paginado de pages (scroll infinito en Explorar).
+    // ---- Descubrimiento (trending, busqueda, tags) ----
+
+    // Hashtags con mas actividad en los ultimos 7 dias.
+    .get('/socials/trending', async ({ auth, query }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const limit = Math.min(20, Number(query.limit) || 8)
+      const since = new Date(Date.now() - 7 * 24 * 3600 * 1000)
+      const rows = await prisma.hashtag.groupBy({
+        by: ['tag'],
+        where: { appId: auth.appId, createdAt: { gte: since } },
+        _count: { tag: true },
+        orderBy: { _count: { tag: 'desc' } },
+        take: limit,
+      })
+      // Si la ventana de 7 dias esta vacia (contenido historico migrado), caemos a todo el historico.
+      const src = rows.length ? rows : await prisma.hashtag.groupBy({
+        by: ['tag'], where: { appId: auth.appId }, _count: { tag: true },
+        orderBy: { _count: { tag: 'desc' } }, take: limit,
+      })
+      return { data: src.map((r: any) => ({ tag: r.tag, count: r._count.tag })) }
+    })
+
+    // Busqueda unificada: pages por handle/nombre + posts por contenido.
+    .get('/socials/search', async ({ auth, query, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const q = String(query.q || '').trim()
+      if (q.length < 2) return { data: { users: [], items: [] } }
+      const limit = Math.min(30, Number(query.limit) || 20)
+      const term = q.replace(/^[#@]/, '')
+      const [pages, rows] = await Promise.all([
+        prisma.page.findMany({
+          where: {
+            appId: auth.appId,
+            OR: [{ handle: { contains: term, mode: 'insensitive' } }, { displayName: { contains: term, mode: 'insensitive' } }],
+          },
+          orderBy: [{ followersCount: 'desc' }, { postsCount: 'desc' }],
+          take: limit, select: pageSel,
+        }),
+        prisma.post.findMany({
+          where: { appId: auth.appId, deletedAt: null, hiddenAt: null, content: { contains: term, mode: 'insensitive' } },
+          orderBy: { createdAt: 'desc' }, take: limit, include: { author: { select: pageSel } },
+        }),
+      ])
+      const viewer = await viewerPage(auth, request.headers)
+      const ids = rows.map((p) => p.id)
+      const [likes, saves] = await Promise.all([likedPosts(auth.appId, viewer, ids), savedPosts(auth.appId, viewer, ids)])
+      return { data: { users: pages.map(shapePage), items: rows.map((p) => shapePost(p, likes, saves)) } }
+    })
+
+    // Posts de un hashtag.
+    .get('/socials/tag/:tag', async ({ auth, params, query, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const tag = String(params.tag || '').replace(/^#/, '').toLowerCase()
+      if (!tag) return { data: { items: [], hasMore: false } }
+      const limit = Math.min(30, Number(query.limit) || 20)
+      const pg = Math.max(0, Number(query.page) || 0)
+      const refs = await prisma.hashtag.findMany({
+        where: { appId: auth.appId, tag }, orderBy: { createdAt: 'desc' },
+        skip: pg * limit, take: limit + 1, select: { postId: true },
+      })
+      const hasMore = refs.length > limit
+      const ids = refs.slice(0, limit).map((r) => r.postId)
+      if (!ids.length) return { data: { items: [], hasMore: false } }
+      const rows = await prisma.post.findMany({ where: { id: { in: ids }, deletedAt: null, hiddenAt: null }, include: { author: { select: pageSel } } })
+      rows.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id))
+      const viewer = await viewerPage(auth, request.headers)
+      const [likes, saves] = await Promise.all([likedPosts(auth.appId, viewer, ids), savedPosts(auth.appId, viewer, ids)])
+      return { data: { items: rows.map((p) => shapePost(p, likes, saves)), hasMore } }
+    })
+
     .get('/pages/directory', async ({ auth, query }: any) => {
       if (!auth) return { error: 'unauthorized' }
       const limit = Math.min(48, Math.max(1, Number(query.limit) || 24))
