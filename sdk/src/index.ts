@@ -34,6 +34,7 @@ export function createHilos(opts: HilosOptions) {
       get: (handle: string): Promise<HilosPage> => req('GET', `/pages/${encodeURIComponent(handle)}`),
       posts: (handle: string, page = 0, limit = 20): Promise<Paged<HilosPost>> => req('GET', `/pages/${encodeURIComponent(handle)}/posts?page=${page}&limit=${limit}`),
       claim: (p: { fromExternalId: string; toExternalId: string; handle?: string; displayName?: string; avatarUrl?: string }): Promise<HilosPage> => req('POST', '/pages/claim', p),
+      update: (handle: string, p: { displayName?: string; bio?: string; avatarUrl?: string | null; bannerUrl?: string | null; handle?: string }, acting?: string | number): Promise<HilosPage> => req('PATCH', `/pages/${encodeURIComponent(handle)}`, p, acting),
       follow: (handle: string, acting?: string | number): Promise<{ following: boolean }> => req('POST', `/pages/${encodeURIComponent(handle)}/follow`, undefined, acting),
     },
     pageTokens: {
@@ -52,6 +53,12 @@ export function createHilos(opts: HilosOptions) {
       fromUrl: (url: string): Promise<{ key: string; publicUrl: string }> => req('POST', '/uploads/fetch', { url }),
     },
     feed: (opt: { scope?: 'following' | 'foryou'; page?: number; limit?: number } = {}): Promise<Paged<HilosPost>> => req('GET', `/feed?scope=${opt.scope || 'foryou'}&page=${opt.page || 0}&limit=${opt.limit || 20}`),
+    messages: {
+      conversations: (page = 0, limit = 20, acting?: string | number) => req('GET', `/conversations?page=${page}&limit=${limit}`, undefined, acting),
+      list: (conversationId: number, page = 0, limit = 40, acting?: string | number) => req('GET', `/conversations/${conversationId}/messages?page=${page}&limit=${limit}`, undefined, acting),
+      send: (handle: string, content: string, acting?: string | number) => req('POST', '/messages', { handle, content }, acting),
+      unread: (acting?: string | number) => req('GET', '/messages/unread', undefined, acting),
+    },
     comments: {
       list: (postId: number): Promise<HilosComment[]> => req('GET', `/posts/${postId}/comments`),
       create: (postId: number, p: { content: string; parentCommentId?: number; parentExternalRef?: string; externalRef?: string; createdAt?: string }, acting?: string | number): Promise<HilosComment> => req('POST', `/posts/${postId}/comments`, p, acting),
