@@ -79,6 +79,8 @@ model Page {
   comments      Comment[]
   memberships   ConversationMember[]
   sentMessages  Message[]
+  notifications Notification[] @relation("NotifTarget")
+  actedNotifs   Notification[] @relation("NotifActor")
 
   @@unique([appId, handle])
   @@unique([appId, externalId])
@@ -258,4 +260,24 @@ model Message {
   @@index([conversationId, createdAt])
   @@index([appId, createdAt])
   @@map("message")
+}
+
+// Avisos para una page: respuestas, menciones, seguidores y mensajes.
+model Notification {
+  id          Int      @id @default(autoincrement())
+  appId       Int
+  pageId      Int      // quien recibe el aviso
+  actorPageId Int?     // quien lo provoco
+  type        String   @db.VarChar(24) // comment | reply | mention | follow | message
+  postId      Int?
+  commentId   Int?
+  preview     String?  @db.VarChar(200)
+  readAt      DateTime? @db.Timestamp(6)
+  createdAt   DateTime @default(now()) @db.Timestamp(6)
+  page        Page     @relation("NotifTarget", fields: [pageId], references: [id], onDelete: Cascade)
+  actor       Page?    @relation("NotifActor", fields: [actorPageId], references: [id], onDelete: SetNull)
+
+  @@index([appId, pageId, createdAt])
+  @@index([appId, pageId, readAt])
+  @@map("notification")
 }

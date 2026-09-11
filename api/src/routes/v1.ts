@@ -43,6 +43,28 @@ function shapePost(p: any, likedSet?: Set<number>, savedSet?: Set<number>) {
     wall: p.wall && p.wall.id !== p.authorPageId ? shapePage(p.wall) : null,
   }
 }
+// Los avisos nunca deben tumbar la accion que los genera: si fallan, se pierden
+// en silencio y el usuario igual ve su comentario publicado.
+function notify(appId: number, pageId: number, actorPageId: number | null, type: string, extra: { postId?: number; commentId?: number; preview?: string } = {}) {
+  if (!pageId || pageId === actorPageId) return
+  prisma.notification.create({
+    data: {
+      appId, pageId, actorPageId, type,
+      postId: extra.postId ?? null,
+      commentId: extra.commentId ?? null,
+      preview: extra.preview ? extra.preview.slice(0, 200) : null,
+    },
+  }).catch(() => {})
+}
+
+// Menciones @handle dentro de un texto.
+async function notifyMentions(appId: number, content: string, actorPageId: number, extra: { postId?: number; commentId?: number }) {
+  const handles = [...new Set([...content.matchAll(/@([a-zA-Z0-9_]{3,40})/g)].map((m) => m[1].toLowerCase()))].slice(0, 10)
+  if (!handles.length) return
+  const pages = await prisma.page.findMany({ where: { appId, handle: { in: handles } }, select: { id: true } }).catch(() => [])
+  for (const p of pages) notify(appId, p.id, actorPageId, 'mention', { ...extra, preview: content })
+}
+
 async function savedPosts(appId: number, pageId: number | null | undefined, postIds: number[]): Promise<Set<number>> {
   if (!pageId || !postIds.length) return new Set()
   const r = await prisma.save.findMany({ where: { appId, pageId, postId: { in: postIds } }, select: { postId: true } })
@@ -499,6 +521,7 @@ export const v1 = () =>
         repostOfId: body.repostOfId ? Number(body.repostOfId) : null, externalRef: body.externalRef ? String(body.externalRef) : null,
         metadata: body.metadata ?? undefined, createdAt: body.createdAt ? new Date(body.createdAt) : undefined,
       }, include: { author: { select: pageSel }, wall: { select: wallSel } } })
+      notifyMentions(auth.appId, content, authorPageId, { postId: post.id })
       const tags = parseHashtags(content)
       if (tags.length) await prisma.hashtag.createMany({ data: tags.map((tag) => ({ appId: auth.appId, postId: post.id, tag })) }).catch(() => {})
       await prisma.page.update({ where: { id: authorPageId }, data: { postsCount: { increment: 1 } } }).catch(() => {})
@@ -631,6 +654,49 @@ export const v1 = () =>
       return { data: { items: shaped, hasMore: has } }
     })
 
+    // ---- Avisos ----
+    .get('/notifications', async ({ auth, query, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      let me: number
+      try { me = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+      const limit = Math.min(50, Number(query.limit) || 20)
+      const pg = Math.max(0, Number(query.page) || 0)
+      const rows = await prisma.notification.findMany({
+        where: { appId: auth.appId, pageId: me },
+        orderBy: { createdAt: 'desc' }, skip: pg * limit, take: limit + 1,
+        include: { actor: { select: pageSel } },
+      })
+      const hasMore = rows.length > limit
+      return {
+        data: {
+          items: rows.slice(0, limit).map((n) => ({
+            id: n.id, type: n.type, postId: n.postId, commentId: n.commentId,
+            preview: n.preview, read: !!n.readAt, createdAt: n.createdAt, actor: shapePage(n.actor),
+          })),
+          hasMore,
+        },
+      }
+    })
+
+    .get('/notifications/unread', async ({ auth, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      let me: number
+      try { me = await actingPage(auth, request.headers) } catch { return { data: { total: 0 } } }
+      const total = await prisma.notification.count({ where: { appId: auth.appId, pageId: me, readAt: null } })
+      return { data: { total } }
+    })
+
+    // Marcar como leidas (todas o una).
+    .post('/notifications/read', async ({ auth, body, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      let me: number
+      try { me = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+      const where: any = { appId: auth.appId, pageId: me, readAt: null }
+      if (body?.id) where.id = Number(body.id)
+      const r = await prisma.notification.updateMany({ where, data: { readAt: new Date() } })
+      return { data: { updated: r.count } }
+    }, { body: t.Optional(t.Object({ id: t.Optional(t.Union([t.String(), t.Number()])) })) })
+
     // ---- Mensajeria directa ----
     // Reglas: puedes ESCRIBIR a alguien solo si tu lo sigues. Y solo puedes
     // LEER lo que te escriben si tu tambien sigues a esa persona. Asi un
@@ -739,6 +805,7 @@ export const v1 = () =>
       }
       const msg = await prisma.message.create({ data: { appId: auth.appId, conversationId: conv.id, senderPageId: me, content, media: body.media ?? undefined }, select: { id: true, content: true, media: true, createdAt: true } })
       await prisma.conversation.update({ where: { id: conv.id }, data: { lastMessageAt: msg.createdAt } }).catch(() => {})
+      notify(auth.appId, target.id, me, 'message', { preview: content })
       return { data: { ...msg, mine: true, conversationId: conv.id } }
     }, { body: t.Object({ handle: t.String(), content: t.String(), media: t.Optional(t.Any()) }) })
 
@@ -830,6 +897,16 @@ export const v1 = () =>
       }
       const c = await prisma.comment.create({ data: { appId: auth.appId, postId: post.id, authorPageId, parentCommentId, externalRef: body.externalRef ? String(body.externalRef) : null, content, createdAt: body.createdAt ? new Date(body.createdAt) : undefined }, include: { author: { select: pageSel } } })
       await prisma.post.update({ where: { id: post.id }, data: { commentsCount: { increment: 1 } } })
+
+      // Avisos: al autor del post y, si es una respuesta, a quien respondes.
+      const target = await prisma.post.findUnique({ where: { id: post.id }, select: { authorPageId: true } }).catch(() => null)
+      if (target) notify(auth.appId, target.authorPageId, authorPageId, 'comment', { postId: post.id, commentId: c.id, preview: content })
+      if (parentCommentId) {
+        const parent = await prisma.comment.findUnique({ where: { id: parentCommentId }, select: { authorPageId: true } }).catch(() => null)
+        if (parent) notify(auth.appId, parent.authorPageId, authorPageId, 'reply', { postId: post.id, commentId: c.id, preview: content })
+      }
+      notifyMentions(auth.appId, content, authorPageId, { postId: post.id, commentId: c.id })
+
       return { data: { id: c.id, content: c.content, parentCommentId: c.parentCommentId, likesCount: 0, createdAt: c.createdAt, author: shapePage(c.author) } }
     }, { body: t.Object({ content: t.String(), parentCommentId: t.Optional(t.Union([t.String(), t.Number()])), parentExternalRef: t.Optional(t.String()), externalRef: t.Optional(t.String()), createdAt: t.Optional(t.String()) }) })
     .delete('/comments/:id', async ({ auth, params }: any) => {
@@ -937,5 +1014,6 @@ export const v1 = () =>
         return { data: { following: false } }
       }
       await prisma.$transaction([prisma.follow.create({ data: { appId: auth.appId, followerPageId, followedPageId: target.id } }), prisma.page.update({ where: { id: target.id }, data: { followersCount: { increment: 1 } } }), prisma.page.update({ where: { id: followerPageId }, data: { followingCount: { increment: 1 } } })])
+      notify(auth.appId, target.id, followerPageId, 'follow')
       return { data: { following: true } }
     })
