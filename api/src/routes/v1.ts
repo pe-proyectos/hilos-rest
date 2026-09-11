@@ -3,7 +3,7 @@ import { prisma } from '../lib/prisma'
 import { resolveAuth, actingPage, viewerPage, requireScope, rateLimit, CLIENT_SCOPES, type AuthCtx } from '../plugins/auth'
 import { signJwt, generateApiKey } from '../lib/crypto'
 import { s3, R2_PUBLIC } from '../lib/s3'
-import { randomBytes } from 'crypto'
+import { randomBytes, createHmac } from 'crypto'
 
 const SECRET = process.env.HILOS_JWT_SECRET || 'dev-secret'
 const MAX_CONTENT = 8000
@@ -43,6 +43,32 @@ function shapePost(p: any, likedSet?: Set<number>, savedSet?: Set<number>) {
     wall: p.wall && p.wall.id !== p.authorPageId ? shapePage(p.wall) : null,
   }
 }
+// Webhooks: hilos no sabe de correos ni de roles. Publica el evento firmado y
+// cada app decide que hacer con el (avisar al staff, mandar un correo...).
+const webhookCache = { exp: 0, map: new Map<number, { url: string; secret: string }>() }
+async function appWebhook(appId: number) {
+  if (webhookCache.exp < Date.now()) {
+    const apps = await prisma.app.findMany({ select: { id: true, webhookUrl: true, webhookSecret: true } }).catch(() => [])
+    webhookCache.map = new Map(apps.filter((a) => a.webhookUrl).map((a) => [a.id, { url: a.webhookUrl!, secret: a.webhookSecret || '' }]))
+    webhookCache.exp = Date.now() + 60_000
+  }
+  return webhookCache.map.get(appId) || null
+}
+
+function emitEvent(appId: number, type: string, data: any) {
+  appWebhook(appId).then(async (hook) => {
+    if (!hook) return
+    const body = JSON.stringify({ type, data, sentAt: new Date().toISOString() })
+    const signature = createHmac('sha256', hook.secret).update(body).digest('hex')
+    await fetch(hook.url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-hilos-event': type, 'x-hilos-signature': signature },
+      body,
+      signal: AbortSignal.timeout(8000),
+    }).catch(() => {})
+  }).catch(() => {})
+}
+
 // Los avisos nunca deben tumbar la accion que los genera: si fallan, se pierden
 // en silencio y el usuario igual ve su comentario publicado.
 function notify(appId: number, pageId: number, actorPageId: number | null, type: string, extra: { postId?: number; commentId?: number; preview?: string } = {}) {
@@ -185,6 +211,18 @@ export const v1 = () =>
       await prisma.apiKey.create({ data: { appId: auth.appId, label: String(body?.label || 'client'), type: 'publishable', prefix: pk.prefix, keyHash: pk.hash } })
       return { data: { publishableKey: pk.full } }
     }, { body: t.Optional(t.Object({ label: t.Optional(t.String()) })) })
+
+    .post('/admin/webhook', async ({ auth, request, body }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      if (!process.env.HILOS_BOOTSTRAP_TOKEN || request.headers.get('x-bootstrap-token') !== process.env.HILOS_BOOTSTRAP_TOKEN) return { error: 'forbidden' }
+      const app = await prisma.app.update({
+        where: { id: auth.appId },
+        data: { webhookUrl: body.url || null, webhookSecret: body.secret || null },
+        select: { id: true, slug: true, webhookUrl: true },
+      })
+      webhookCache.exp = 0
+      return { data: app }
+    }, { body: t.Object({ url: t.Optional(t.String()), secret: t.Optional(t.String()) }) })
 
     .post('/admin/app-config', async ({ auth, request, body }: any) => {
       if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
@@ -976,6 +1014,35 @@ export const v1 = () =>
         if (parent) notify(auth.appId, parent.authorPageId, authorPageId, 'reply', { postId: post.id, commentId: c.id, preview: content })
       }
       notifyMentions(auth.appId, content, authorPageId, { postId: post.id, commentId: c.id })
+
+      // Contexto para que la app pueda avisar por correo a quien corresponda.
+      const full = await prisma.post.findUnique({
+        where: { id: post.id },
+        select: {
+          id: true, content: true, externalRef: true, authorPageId: true,
+          author: { select: { handle: true, externalId: true, displayName: true, type: true } },
+          wall: { select: { handle: true, externalId: true, displayName: true, type: true } },
+        },
+      }).catch(() => null)
+      // Participantes del hilo: quien ya ha hablado ahí merece enterarse.
+      const rootId = parentCommentId
+        ? ((await prisma.comment.findUnique({ where: { id: parentCommentId }, select: { parentCommentId: true, id: true } }).catch(() => null))?.parentCommentId ?? parentCommentId)
+        : c.id
+      const thread = await prisma.comment.findMany({
+        where: { appId: auth.appId, postId: post.id, deletedAt: null, OR: [{ id: rootId }, { parentCommentId: rootId }] },
+        select: { authorPageId: true, author: { select: { handle: true, externalId: true } } },
+      }).catch(() => [])
+      const parentAuthor = parentCommentId
+        ? await prisma.comment.findUnique({ where: { id: parentCommentId }, select: { author: { select: { handle: true, externalId: true, displayName: true } } } }).catch(() => null)
+        : null
+
+      emitEvent(auth.appId, 'comment.created', {
+        comment: { id: c.id, content: c.content, createdAt: c.createdAt, parentCommentId: c.parentCommentId },
+        author: { handle: c.author.handle, externalId: c.author.externalId, displayName: c.author.displayName, avatarUrl: c.author.avatarUrl },
+        post: full ? { id: full.id, content: full.content, externalRef: full.externalRef, author: full.author, wall: full.wall } : { id: post.id },
+        replyTo: parentAuthor?.author ?? null,
+        threadParticipants: [...new Map(thread.filter((t) => t.authorPageId !== authorPageId).map((t) => [t.author.externalId, t.author])).values()],
+      })
 
       return { data: { id: c.id, content: c.content, parentCommentId: c.parentCommentId, likesCount: 0, createdAt: c.createdAt, author: shapePage(c.author) } }
     }, { body: t.Object({ content: t.String(), parentCommentId: t.Optional(t.Union([t.String(), t.Number()])), parentExternalRef: t.Optional(t.String()), externalRef: t.Optional(t.String()), createdAt: t.Optional(t.String()) }) })

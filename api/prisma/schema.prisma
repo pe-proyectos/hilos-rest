@@ -26,6 +26,8 @@ model App {
   developerId    Int
   name           String   @db.VarChar(120)
   slug           String   @unique @db.VarChar(120)
+  webhookUrl     String?
+  webhookSecret  String?  @db.VarChar(80)
   allowedOrigins String?  @db.VarChar(1000)
   createdAt   DateTime @default(now()) @db.Timestamp(6)
   developer   Developer @relation(fields: [developerId], references: [id], onDelete: Cascade)
