@@ -783,7 +783,7 @@ export const v1 = () =>
         orderBy: { createdAt: 'asc' },
         skip: paged ? pg * limit : 0,
         take: paged ? limit + 1 : 200,
-        include: { author: { select: pageSel }, wall: { select: wallSel } },
+        include: { author: { select: pageSel } },
       })
       const hasMore = paged && rows.length > limit
       const shown = paged ? rows.slice(0, limit) : rows
@@ -819,7 +819,7 @@ export const v1 = () =>
       if (!content) return { error: 'empty_comment' }
       // Dedupe por externalRef (migraciones idempotentes).
       if (body.externalRef) {
-        const dup = await prisma.comment.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef: String(body.externalRef) } }, include: { author: { select: pageSel }, wall: { select: wallSel } } }).catch(() => null)
+        const dup = await prisma.comment.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef: String(body.externalRef) } }, include: { author: { select: pageSel } } }).catch(() => null)
         if (dup) return { data: { id: dup.id, content: dup.content, parentCommentId: dup.parentCommentId, likesCount: dup.likesCount, createdAt: dup.createdAt, author: shapePage(dup.author) }, deduped: true }
       }
       // El padre puede venir por id propio o por su externalRef original.
@@ -828,7 +828,7 @@ export const v1 = () =>
         const p = await prisma.comment.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef: String(body.parentExternalRef) } }, select: { id: true } }).catch(() => null)
         parentCommentId = p?.id ?? null
       }
-      const c = await prisma.comment.create({ data: { appId: auth.appId, postId: post.id, authorPageId, parentCommentId, externalRef: body.externalRef ? String(body.externalRef) : null, content, createdAt: body.createdAt ? new Date(body.createdAt) : undefined }, include: { author: { select: pageSel }, wall: { select: wallSel } } })
+      const c = await prisma.comment.create({ data: { appId: auth.appId, postId: post.id, authorPageId, parentCommentId, externalRef: body.externalRef ? String(body.externalRef) : null, content, createdAt: body.createdAt ? new Date(body.createdAt) : undefined }, include: { author: { select: pageSel } } })
       await prisma.post.update({ where: { id: post.id }, data: { commentsCount: { increment: 1 } } })
       return { data: { id: c.id, content: c.content, parentCommentId: c.parentCommentId, likesCount: 0, createdAt: c.createdAt, author: shapePage(c.author) } }
     }, { body: t.Object({ content: t.String(), parentCommentId: t.Optional(t.Union([t.String(), t.Number()])), parentExternalRef: t.Optional(t.String()), externalRef: t.Optional(t.String()), createdAt: t.Optional(t.String()) }) })
