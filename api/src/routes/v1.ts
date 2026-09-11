@@ -46,6 +46,33 @@ export const v1 = () =>
     .derive(async ({ request }) => ({ auth: await resolveAuth(request.headers) as AuthCtx | null }))
     .get('/health', () => ({ ok: true, service: 'hilos.rest', version: '0.1.0' }))
 
+    // Purga de contenido de la app (mantiene app y API keys). Protegido por
+    // HILOS_BOOTSTRAP_TOKEN + confirmacion explicita. Uso administrativo.
+    .post('/admin/purge', async ({ auth, request, body }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      if (!process.env.HILOS_BOOTSTRAP_TOKEN || request.headers.get('x-bootstrap-token') !== process.env.HILOS_BOOTSTRAP_TOKEN) return { error: 'forbidden' }
+      if (body?.confirm !== 'PURGE') return { error: 'confirm_required' }
+      const appId = auth.appId
+      const before = {
+        pages: await prisma.page.count({ where: { appId } }),
+        posts: await prisma.post.count({ where: { appId } }),
+        comments: await prisma.comment.count({ where: { appId } }),
+      }
+      // Orden: hijos -> padres (los FK tienen cascade, pero somos explicitos).
+      await prisma.hashtag.deleteMany({ where: { appId } })
+      await prisma.reaction.deleteMany({ where: { appId } })
+      await prisma.follow.deleteMany({ where: { appId } })
+      await prisma.comment.deleteMany({ where: { appId } })
+      await prisma.post.deleteMany({ where: { appId } })
+      await prisma.page.deleteMany({ where: { appId } })
+      const after = {
+        pages: await prisma.page.count({ where: { appId } }),
+        posts: await prisma.post.count({ where: { appId } }),
+        comments: await prisma.comment.count({ where: { appId } }),
+      }
+      return { data: { purged: true, before, after } }
+    }, { body: t.Object({ confirm: t.String() }) })
+
     // URL prefirmada para subir media (imagenes de posts/comentarios).
     .post('/uploads', async ({ auth, body }: any) => {
       if (!auth) return { error: 'unauthorized' }
