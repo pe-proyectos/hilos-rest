@@ -279,6 +279,30 @@ export const v1 = () =>
       return { data: src.slice(0, limit).map((r: any) => ({ tag: r.tag, count: r._count.tag })) }
     })
 
+    // Pages con mas movimiento (posts recientes). Es lo que de verdad esta
+    // pasando en la red cuando todavia no hay hashtags con traccion.
+    .get('/socials/active', async ({ auth, query }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const limit = Math.min(20, Number(query.limit) || 6)
+      const days = Math.min(90, Math.max(1, Number(query.days) || 7))
+      const since = new Date(Date.now() - days * 24 * 3600 * 1000)
+      const rows = await prisma.post.groupBy({
+        by: ['wallPageId'],
+        where: { appId: auth.appId, deletedAt: null, hiddenAt: null, createdAt: { gte: since } },
+        _count: { wallPageId: true },
+        orderBy: { _count: { wallPageId: 'desc' } },
+        take: limit,
+      })
+      if (!rows.length) return { data: [] }
+      const pages = await prisma.page.findMany({ where: { id: { in: rows.map((r) => r.wallPageId) } }, select: pageSel })
+      const byId = new Map(pages.map((p) => [p.id, p]))
+      return {
+        data: rows
+          .map((r) => ({ page: shapePage(byId.get(r.wallPageId)), count: r._count.wallPageId }))
+          .filter((r) => r.page),
+      }
+    })
+
     // Busqueda unificada: pages por handle/nombre + posts por contenido.
     .get('/socials/search', async ({ auth, query, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
