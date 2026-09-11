@@ -244,7 +244,14 @@ export const v1 = () =>
       const page = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: params.handle } }, select: { id: true } })
       if (!page) return { error: 'not_found' }
       const limit = Math.min(50, Math.max(1, Number(query.limit) || 20)), pg = Math.max(0, Number(query.page) || 0)
-      const rows = await prisma.post.findMany({ where: { appId: auth.appId, wallPageId: page.id, deletedAt: null, hiddenAt: null }, orderBy: [{ pinned: 'desc' }, { createdAt: 'desc' }], skip: pg * limit, take: limit + 1, include: { author: { select: pageSel } } })
+      // Por defecto el perfil muestra lo que la page PUBLICÓ (autoría) y lo que
+      // hay en su muro. ?only=wall|authored acota.
+      const only = String(query.only || '')
+      const where: any = { appId: auth.appId, deletedAt: null, hiddenAt: null }
+      if (only === 'wall') where.wallPageId = page.id
+      else if (only === 'authored') where.authorPageId = page.id
+      else where.OR = [{ authorPageId: page.id }, { wallPageId: page.id }]
+      const rows = await prisma.post.findMany({ where, orderBy: [{ pinned: 'desc' }, { createdAt: 'desc' }], skip: pg * limit, take: limit + 1, include: { author: { select: pageSel } } })
       const has = rows.length > limit, items = rows.slice(0, limit)
       const likes = await likedPosts(auth.appId, auth.pageId, items.map((p) => p.id))
       return { data: { items: items.map((p) => shapePost(p, likes)), hasMore: has } }
