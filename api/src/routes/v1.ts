@@ -32,12 +32,15 @@ function parseHashtags(c: string): string[] {
 }
 const pageSel = { id: true, handle: true, type: true, parentPageId: true, externalId: true, displayName: true, avatarUrl: true, bannerUrl: true, bio: true, followersCount: true, followingCount: true, postsCount: true, createdAt: true }
 function shapePage(p: any) { return p ? { ...p } : null }
+const wallSel = { id: true, handle: true, type: true, displayName: true, avatarUrl: true, parentPageId: true }
 function shapePost(p: any, likedSet?: Set<number>, savedSet?: Set<number>) {
   return {
     id: p.id, content: p.content, media: p.media ?? null, repostOfId: p.repostOfId ?? null, externalRef: p.externalRef ?? null,
     likesCount: p.likesCount, commentsCount: p.commentsCount, repostCount: p.repostCount, pinned: p.pinned,
     createdAt: p.createdAt, liked: likedSet ? likedSet.has(p.id) : undefined, saved: savedSet ? savedSet.has(p.id) : undefined,
     author: shapePage(p.author), wallPageId: p.wallPageId,
+    // Solo cuando el muro es otra page (p. ej. la obra donde se publica el capítulo).
+    wall: p.wall && p.wall.id !== p.authorPageId ? shapePage(p.wall) : null,
   }
 }
 async function savedPosts(appId: number, pageId: number | null | undefined, postIds: number[]): Promise<Set<number>> {
@@ -333,7 +336,7 @@ export const v1 = () =>
         }),
         prisma.post.findMany({
           where: { appId: auth.appId, deletedAt: null, hiddenAt: null, content: { contains: term, mode: 'insensitive' } },
-          orderBy: { createdAt: 'desc' }, take: limit, include: { author: { select: pageSel } },
+          orderBy: { createdAt: 'desc' }, take: limit, include: { author: { select: pageSel }, wall: { select: wallSel } },
         }),
       ])
       const viewer = await viewerPage(auth, request.headers)
@@ -356,7 +359,7 @@ export const v1 = () =>
       const hasMore = refs.length > limit
       const ids = refs.slice(0, limit).map((r) => r.postId)
       if (!ids.length) return { data: { items: [], hasMore: false } }
-      const rows = await prisma.post.findMany({ where: { id: { in: ids }, deletedAt: null, hiddenAt: null }, include: { author: { select: pageSel } } })
+      const rows = await prisma.post.findMany({ where: { id: { in: ids }, deletedAt: null, hiddenAt: null }, include: { author: { select: pageSel }, wall: { select: wallSel } } })
       rows.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id))
       const viewer = await viewerPage(auth, request.headers)
       const [likes, saves] = await Promise.all([likedPosts(auth.appId, viewer, ids), savedPosts(auth.appId, viewer, ids)])
@@ -461,7 +464,7 @@ export const v1 = () =>
       if (only === 'wall') where.wallPageId = page.id
       else if (only === 'authored') where.authorPageId = page.id
       else where.OR = [{ authorPageId: page.id }, { wallPageId: page.id }]
-      const rows = await prisma.post.findMany({ where, orderBy: [{ pinned: 'desc' }, { createdAt: 'desc' }], skip: pg * limit, take: limit + 1, include: { author: { select: pageSel } } })
+      const rows = await prisma.post.findMany({ where, orderBy: [{ pinned: 'desc' }, { createdAt: 'desc' }], skip: pg * limit, take: limit + 1, include: { author: { select: pageSel }, wall: { select: wallSel } } })
       const has = rows.length > limit, items = rows.slice(0, limit)
       const ids = items.map((p) => p.id)
       const viewer = await viewerPage(auth, request.headers)
@@ -488,14 +491,14 @@ export const v1 = () =>
       }
       // Dedupe por externalRef (auto-post/migracion idempotente).
       if (body.externalRef) {
-        const dup = await prisma.post.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef: String(body.externalRef) } }, include: { author: { select: pageSel } } }).catch(() => null)
+        const dup = await prisma.post.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef: String(body.externalRef) } }, include: { author: { select: pageSel }, wall: { select: wallSel } } }).catch(() => null)
         if (dup) return { data: shapePost(dup), deduped: true }
       }
       const post = await prisma.post.create({ data: {
         appId: auth.appId, authorPageId, wallPageId, content, media: body.media ?? undefined,
         repostOfId: body.repostOfId ? Number(body.repostOfId) : null, externalRef: body.externalRef ? String(body.externalRef) : null,
         metadata: body.metadata ?? undefined, createdAt: body.createdAt ? new Date(body.createdAt) : undefined,
-      }, include: { author: { select: pageSel } } })
+      }, include: { author: { select: pageSel }, wall: { select: wallSel } } })
       const tags = parseHashtags(content)
       if (tags.length) await prisma.hashtag.createMany({ data: tags.map((tag) => ({ appId: auth.appId, postId: post.id, tag })) }).catch(() => {})
       await prisma.page.update({ where: { id: authorPageId }, data: { postsCount: { increment: 1 } } }).catch(() => {})
@@ -514,7 +517,7 @@ export const v1 = () =>
 
     .get('/posts/:id', async ({ auth, params, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
-      const p = await prisma.post.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, include: { author: { select: pageSel } } })
+      const p = await prisma.post.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, include: { author: { select: pageSel }, wall: { select: wallSel } } })
       if (!p) return { error: 'not_found' }
       const viewer = await viewerPage(auth, request.headers)
       const [likes, saves] = await Promise.all([likedPosts(auth.appId, viewer, [p.id]), savedPosts(auth.appId, viewer, [p.id])])
@@ -552,7 +555,7 @@ export const v1 = () =>
         const rows = await prisma.post.findMany({
           where: { appId: auth.appId, deletedAt: null, hiddenAt: null, OR: [{ authorPageId: { in: ids } }, { wallPageId: { in: ids } }] },
           orderBy: [{ createdAt: 'desc' }], skip: pg * limit, take: limit + 1,
-          include: { author: { select: pageSel } },
+          include: { author: { select: pageSel }, wall: { select: wallSel } },
         })
         has = rows.length > limit
         items = rows.slice(0, limit)
@@ -560,7 +563,7 @@ export const v1 = () =>
         const rows = await prisma.post.findMany({
           where: { appId: auth.appId, deletedAt: null, hiddenAt: null },
           orderBy: [{ createdAt: 'desc' }], skip: pg * limit, take: limit + 1,
-          include: { author: { select: pageSel } },
+          include: { author: { select: pageSel }, wall: { select: wallSel } },
         })
         has = rows.length > limit
         items = rows.slice(0, limit)
@@ -583,7 +586,7 @@ export const v1 = () =>
         has = ids.length > limit
         const keep = ids.slice(0, limit)
         if (keep.length) {
-          const rows = await prisma.post.findMany({ where: { id: { in: keep } }, include: { author: { select: pageSel } } })
+          const rows = await prisma.post.findMany({ where: { id: { in: keep } }, include: { author: { select: pageSel }, wall: { select: wallSel } } })
           const byId = new Map(rows.map((r) => [r.id, r]))
           items = keep.map((id) => byId.get(id)).filter(Boolean) as any[]
         }
@@ -591,7 +594,7 @@ export const v1 = () =>
         if (!items.length && pg === 0) {
           const rows = await prisma.post.findMany({
             where: { appId: auth.appId, deletedAt: null, hiddenAt: null },
-            orderBy: [{ createdAt: 'desc' }], take: limit + 1, include: { author: { select: pageSel } },
+            orderBy: [{ createdAt: 'desc' }], take: limit + 1, include: { author: { select: pageSel }, wall: { select: wallSel } },
           })
           has = rows.length > limit
           items = rows.slice(0, limit)
@@ -780,7 +783,7 @@ export const v1 = () =>
         orderBy: { createdAt: 'asc' },
         skip: paged ? pg * limit : 0,
         take: paged ? limit + 1 : 200,
-        include: { author: { select: pageSel } },
+        include: { author: { select: pageSel }, wall: { select: wallSel } },
       })
       const hasMore = paged && rows.length > limit
       const shown = paged ? rows.slice(0, limit) : rows
@@ -816,7 +819,7 @@ export const v1 = () =>
       if (!content) return { error: 'empty_comment' }
       // Dedupe por externalRef (migraciones idempotentes).
       if (body.externalRef) {
-        const dup = await prisma.comment.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef: String(body.externalRef) } }, include: { author: { select: pageSel } } }).catch(() => null)
+        const dup = await prisma.comment.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef: String(body.externalRef) } }, include: { author: { select: pageSel }, wall: { select: wallSel } } }).catch(() => null)
         if (dup) return { data: { id: dup.id, content: dup.content, parentCommentId: dup.parentCommentId, likesCount: dup.likesCount, createdAt: dup.createdAt, author: shapePage(dup.author) }, deduped: true }
       }
       // El padre puede venir por id propio o por su externalRef original.
@@ -825,7 +828,7 @@ export const v1 = () =>
         const p = await prisma.comment.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef: String(body.parentExternalRef) } }, select: { id: true } }).catch(() => null)
         parentCommentId = p?.id ?? null
       }
-      const c = await prisma.comment.create({ data: { appId: auth.appId, postId: post.id, authorPageId, parentCommentId, externalRef: body.externalRef ? String(body.externalRef) : null, content, createdAt: body.createdAt ? new Date(body.createdAt) : undefined }, include: { author: { select: pageSel } } })
+      const c = await prisma.comment.create({ data: { appId: auth.appId, postId: post.id, authorPageId, parentCommentId, externalRef: body.externalRef ? String(body.externalRef) : null, content, createdAt: body.createdAt ? new Date(body.createdAt) : undefined }, include: { author: { select: pageSel }, wall: { select: wallSel } } })
       await prisma.post.update({ where: { id: post.id }, data: { commentsCount: { increment: 1 } } })
       return { data: { id: c.id, content: c.content, parentCommentId: c.parentCommentId, likesCount: 0, createdAt: c.createdAt, author: shapePage(c.author) } }
     }, { body: t.Object({ content: t.String(), parentCommentId: t.Optional(t.Union([t.String(), t.Number()])), parentExternalRef: t.Optional(t.String()), externalRef: t.Optional(t.String()), createdAt: t.Optional(t.String()) }) })
@@ -914,7 +917,7 @@ export const v1 = () =>
       const hasMore = rows.length > limit
       const ids = rows.slice(0, limit).map((r) => r.postId)
       if (!ids.length) return { data: { items: [], hasMore: false } }
-      const posts = await prisma.post.findMany({ where: { id: { in: ids }, deletedAt: null }, include: { author: { select: pageSel } } })
+      const posts = await prisma.post.findMany({ where: { id: { in: ids }, deletedAt: null }, include: { author: { select: pageSel }, wall: { select: wallSel } } })
       posts.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id))
       const likes = await likedPosts(auth.appId, pageId, ids)
       return { data: { items: posts.map((p) => ({ ...shapePost(p, likes), saved: true })), hasMore } }
