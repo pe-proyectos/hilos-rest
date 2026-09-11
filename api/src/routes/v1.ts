@@ -455,13 +455,16 @@ export const v1 = () =>
       return { data: { items: rows.slice(0, limit).map(shapePage), hasMore } }
     })
 
-    .get('/pages/suggested', async ({ auth, query }: any) => {
+    .get('/pages/suggested', async ({ auth, query, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
       const limit = Math.min(10, Math.max(1, Number(query.limit) || 5))
+      // El espectador puede venir por token o por cabecera: si no lo resolvemos,
+      // seguimos sugiriendo cuentas que la persona ya sigue.
+      const viewer = await viewerPage(auth, request.headers)
       let excludeIds: number[] = []
-      if (auth.pageId) {
-        const f = await prisma.follow.findMany({ where: { appId: auth.appId, followerPageId: auth.pageId }, select: { followedPageId: true } })
-        excludeIds = [...f.map((x) => x.followedPageId), auth.pageId]
+      if (viewer) {
+        const f = await prisma.follow.findMany({ where: { appId: auth.appId, followerPageId: viewer }, select: { followedPageId: true } })
+        excludeIds = [...f.map((x) => x.followedPageId), viewer]
       }
       const type = String(query.type || '')
       const types = type === 'user' ? ['user'] : type === 'scan' ? ['scan'] : ['scan', 'user']
@@ -470,7 +473,7 @@ export const v1 = () =>
         orderBy: [{ followersCount: 'desc' }, { postsCount: 'desc' }, { id: 'asc' }],
         take: limit, select: pageSel,
       })
-      return { data: rows.map(shapePage) }
+      return { data: rows.map((p) => ({ ...shapePage(p), viewerFollows: false })) }
     })
 
     .get('/pages/:handle/followers', async ({ auth, params, query }: any) => {
