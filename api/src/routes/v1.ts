@@ -27,13 +27,18 @@ function parseHashtags(c: string): string[] {
 }
 const pageSel = { id: true, handle: true, type: true, parentPageId: true, externalId: true, displayName: true, avatarUrl: true, bio: true, followersCount: true, followingCount: true, postsCount: true }
 function shapePage(p: any) { return p ? { ...p } : null }
-function shapePost(p: any, likedSet?: Set<number>) {
+function shapePost(p: any, likedSet?: Set<number>, savedSet?: Set<number>) {
   return {
     id: p.id, content: p.content, media: p.media ?? null, repostOfId: p.repostOfId ?? null, externalRef: p.externalRef ?? null,
     likesCount: p.likesCount, commentsCount: p.commentsCount, repostCount: p.repostCount, pinned: p.pinned,
-    createdAt: p.createdAt, liked: likedSet ? likedSet.has(p.id) : undefined,
+    createdAt: p.createdAt, liked: likedSet ? likedSet.has(p.id) : undefined, saved: savedSet ? savedSet.has(p.id) : undefined,
     author: shapePage(p.author), wallPageId: p.wallPageId,
   }
+}
+async function savedPosts(appId: number, pageId: number | null | undefined, postIds: number[]): Promise<Set<number>> {
+  if (!pageId || !postIds.length) return new Set()
+  const r = await prisma.save.findMany({ where: { appId, pageId, postId: { in: postIds } }, select: { postId: true } })
+  return new Set(r.map((x) => x.postId))
 }
 async function likedPosts(appId: number, pageId: number | null | undefined, postIds: number[]): Promise<Set<number>> {
   if (!pageId || !postIds.length) return new Set()
@@ -311,8 +316,9 @@ export const v1 = () =>
       else where.OR = [{ authorPageId: page.id }, { wallPageId: page.id }]
       const rows = await prisma.post.findMany({ where, orderBy: [{ pinned: 'desc' }, { createdAt: 'desc' }], skip: pg * limit, take: limit + 1, include: { author: { select: pageSel } } })
       const has = rows.length > limit, items = rows.slice(0, limit)
-      const likes = await likedPosts(auth.appId, auth.pageId, items.map((p) => p.id))
-      return { data: { items: items.map((p) => shapePost(p, likes)), hasMore: has } }
+      const ids = items.map((p) => p.id)
+      const [likes, saves] = await Promise.all([likedPosts(auth.appId, auth.pageId, ids), savedPosts(auth.appId, auth.pageId, ids)])
+      return { data: { items: items.map((p) => shapePost(p, likes, saves)), hasMore: has } }
     })
 
     // ---- Posts ----
@@ -362,8 +368,8 @@ export const v1 = () =>
       if (!auth) return { error: 'unauthorized' }
       const p = await prisma.post.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, include: { author: { select: pageSel } } })
       if (!p) return { error: 'not_found' }
-      const likes = await likedPosts(auth.appId, auth.pageId, [p.id])
-      return { data: shapePost(p, likes) }
+      const [likes, saves] = await Promise.all([likedPosts(auth.appId, auth.pageId, [p.id]), savedPosts(auth.appId, auth.pageId, [p.id])])
+      return { data: shapePost(p, likes, saves) }
     })
 
     .delete('/posts/:id', async ({ auth, params, request }: any) => {
@@ -389,8 +395,9 @@ export const v1 = () =>
       }
       const rows = await prisma.post.findMany({ where, orderBy: [{ createdAt: 'desc' }], skip: pg * limit, take: limit + 1, include: { author: { select: pageSel } } })
       const has = rows.length > limit, items = rows.slice(0, limit)
-      const likes = await likedPosts(auth.appId, auth.pageId, items.map((p) => p.id))
-      return { data: { items: items.map((p) => shapePost(p, likes)), hasMore: has } }
+      const ids = items.map((p) => p.id)
+      const [likes, saves] = await Promise.all([likedPosts(auth.appId, auth.pageId, ids), savedPosts(auth.appId, auth.pageId, ids)])
+      return { data: { items: items.map((p) => shapePost(p, likes, saves)), hasMore: has } }
     })
 
     // ---- Comments ----
@@ -452,6 +459,34 @@ export const v1 = () =>
       const p = await prisma.post.findUnique({ where: { id }, select: { likesCount: true } })
       return { data: { liked: true, likesCount: p?.likesCount ?? 1 } }
     })
+    .post('/posts/:id/save', async ({ auth, params, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      if (!requireScope(auth, 'react')) return { error: 'insufficient_scope' }
+      let pageId: number
+      try { pageId = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+      const postId = Number(params.id)
+      const existing = await prisma.save.findUnique({ where: { appId_postId_pageId: { appId: auth.appId, postId, pageId } }, select: { id: true } })
+      if (existing) { await prisma.save.delete({ where: { id: existing.id } }); return { data: { saved: false } } }
+      await prisma.save.create({ data: { appId: auth.appId, postId, pageId } })
+      return { data: { saved: true } }
+    })
+
+    .get('/saved', async ({ auth, query, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      let pageId: number
+      try { pageId = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+      const limit = Math.min(30, Number(query.limit) || 20)
+      const pg = Math.max(0, Number(query.page) || 0)
+      const rows = await prisma.save.findMany({ where: { appId: auth.appId, pageId }, orderBy: { createdAt: 'desc' }, skip: pg * limit, take: limit + 1, select: { postId: true } })
+      const hasMore = rows.length > limit
+      const ids = rows.slice(0, limit).map((r) => r.postId)
+      if (!ids.length) return { data: { items: [], hasMore: false } }
+      const posts = await prisma.post.findMany({ where: { id: { in: ids }, deletedAt: null }, include: { author: { select: pageSel } } })
+      posts.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id))
+      const likes = await likedPosts(auth.appId, pageId, ids)
+      return { data: { items: posts.map((p) => ({ ...shapePost(p, likes), saved: true })), hasMore } }
+    })
+
     .post('/pages/:handle/follow', async ({ auth, params, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
       if (!requireScope(auth, 'follow')) return { error: 'insufficient_scope' }

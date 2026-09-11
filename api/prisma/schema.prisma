@@ -110,6 +110,7 @@ model Post {
   reposts       Post[]    @relation("PostReposts")
   comments      Comment[]
   hashtags      Hashtag[]
+  saves         Save[]
 
   @@unique([appId, externalRef])
   @@index([appId, wallPageId, createdAt])
@@ -193,3 +194,16 @@ model RevokedToken {
   @@map("revoked_token")
 }
 
+// Guardados (bookmarks) de una page sobre un post.
+model Save {
+  id        Int      @id @default(autoincrement())
+  appId     Int
+  postId    Int
+  pageId    Int
+  createdAt DateTime @default(now()) @db.Timestamp(6)
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@unique([appId, postId, pageId])
+  @@index([appId, pageId, createdAt])
+  @@map("save")
+}

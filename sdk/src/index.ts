@@ -42,6 +42,8 @@ export function createHilos(opts: HilosOptions) {
     posts: {
       create: (p: { content?: string; media?: any; wallHandle?: string; wallExternalId?: string | number; wallPageId?: number; repostOfId?: number; externalRef?: string; metadata?: any; createdAt?: string }, acting?: string | number): Promise<HilosPost> => req('POST', '/posts', p, acting),
       get: (id: number): Promise<HilosPost> => req('GET', `/posts/${id}`),
+      save: (id: number): Promise<{ saved: boolean }> => req('POST', `/posts/${id}/save`),
+      saved: (page = 0, limit = 20) => req('GET', `/saved?page=${page}&limit=${limit}`),
       byRef: (ref: string): Promise<{ id: number; wallPageId: number }> => req('GET', `/posts/by-ref?ref=${encodeURIComponent(ref)}`),
       remove: (id: number, acting?: string | number): Promise<{ ok: boolean }> => req('DELETE', `/posts/${id}`, undefined, acting),
       like: (id: number, acting?: string | number): Promise<{ liked: boolean; likesCount: number }> => req('POST', `/posts/${id}/like`, undefined, acting),
