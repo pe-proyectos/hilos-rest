@@ -30,7 +30,7 @@ function parseHashtags(c: string): string[] {
   }
   return [...out].slice(0, 12)
 }
-const pageSel = { id: true, handle: true, type: true, parentPageId: true, externalId: true, displayName: true, avatarUrl: true, bio: true, followersCount: true, followingCount: true, postsCount: true }
+const pageSel = { id: true, handle: true, type: true, parentPageId: true, externalId: true, displayName: true, avatarUrl: true, bannerUrl: true, bio: true, followersCount: true, followingCount: true, postsCount: true, createdAt: true }
 function shapePage(p: any) { return p ? { ...p } : null }
 function shapePost(p: any, likedSet?: Set<number>, savedSet?: Set<number>) {
   return {
@@ -138,6 +138,8 @@ export const v1 = () =>
     // URL prefirmada para subir media (imagenes de posts/comentarios).
     .post('/uploads', async ({ auth, body }: any) => {
       if (!auth) return { error: 'unauthorized' }
+      // Subidas desde el navegador: hace falta permiso de escritura.
+      if (auth.mode === 'page' && !(requireScope(auth, 'post:write') || requireScope(auth, 'comment:write'))) return { error: 'insufficient_scope' }
       const c = s3(); if (!c) return { error: 'storage_not_configured' }
       const name = String(body.filename || 'file').replace(/[^a-zA-Z0-9._-]/g, '_').slice(-60)
       const ct = String(body.contentType || 'application/octet-stream')
@@ -417,6 +419,36 @@ export const v1 = () =>
       return { data: pages.map(shapePage) }
     })
 
+    // Editar el propio perfil. Con page token solo puede editarse uno mismo;
+    // con secret key la app puede editar cualquiera de sus pages.
+    .patch('/pages/:handle', async ({ auth, params, body, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const page = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: String(params.handle).toLowerCase() } }, select: { id: true, handle: true } })
+      if (!page) return { error: 'not_found' }
+      if (auth.mode !== 'secret') {
+        let me: number
+        try { me = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+        if (me !== page.id) return { error: 'forbidden' }
+      }
+      const data: any = {}
+      if (body.displayName !== undefined) data.displayName = String(body.displayName).trim().slice(0, 200) || null
+      if (body.bio !== undefined) data.bio = String(body.bio).trim().slice(0, 600) || null
+      if (body.avatarUrl !== undefined) data.avatarUrl = body.avatarUrl ? String(body.avatarUrl).slice(0, 500) : null
+      if (body.bannerUrl !== undefined) data.bannerUrl = body.bannerUrl ? String(body.bannerUrl).slice(0, 500) : null
+      if (body.handle !== undefined) {
+        const h = String(body.handle).toLowerCase().replace(/[^a-z0-9_]/g, '')
+        if (h.length < 3) return { error: 'handle_too_short' }
+        if (h !== page.handle) {
+          const taken = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: h } }, select: { id: true } })
+          if (taken) return { error: 'handle_taken' }
+          data.handle = h
+        }
+      }
+      if (!Object.keys(data).length) return { error: 'nothing_to_update' }
+      const updated = await prisma.page.update({ where: { id: page.id }, data, select: pageSel })
+      return { data: shapePage(updated) }
+    }, { body: t.Object({ displayName: t.Optional(t.String()), bio: t.Optional(t.String()), avatarUrl: t.Optional(t.Union([t.String(), t.Null()])), bannerUrl: t.Optional(t.Union([t.String(), t.Null()])), handle: t.Optional(t.String()) }) })
+
     .get('/pages/:handle/posts', async ({ auth, params, query, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
       const page = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: params.handle } }, select: { id: true } })
@@ -504,18 +536,234 @@ export const v1 = () =>
     .get('/feed', async ({ auth, query, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
       const limit = Math.min(50, Math.max(1, Number(query.limit) || 20)), pg = Math.max(0, Number(query.page) || 0)
-      const where: any = { appId: auth.appId, deletedAt: null, hiddenAt: null }
-      if (query.scope === 'following' && auth.pageId) {
-        const f = await prisma.follow.findMany({ where: { appId: auth.appId, followerPageId: auth.pageId }, select: { followedPageId: true } })
-        const ids = f.map((x) => x.followedPageId)
-        where.authorPageId = { in: ids.length ? [...ids, auth.pageId] : [auth.pageId] }
-      }
-      const rows = await prisma.post.findMany({ where, orderBy: [{ createdAt: 'desc' }], skip: pg * limit, take: limit + 1, include: { author: { select: pageSel } } })
-      const has = rows.length > limit, items = rows.slice(0, limit)
-      const ids = items.map((p) => p.id)
       const viewer = await viewerPage(auth, request.headers)
+      const scope = String(query.scope || 'foryou')
+      const withReplies = query.replies === '1' || query.replies === 'true'
+
+      let items: any[] = []
+      let has = false
+
+      if (scope === 'following') {
+        // Tu manada: cronologico puro de a quien sigues. Sin ranking, para que
+        // no se pierda nada de la gente que elegiste.
+        if (!viewer) return { data: { items: [], hasMore: false } }
+        const f = await prisma.follow.findMany({ where: { appId: auth.appId, followerPageId: viewer }, select: { followedPageId: true } })
+        const ids = [...f.map((x) => x.followedPageId), viewer]
+        const rows = await prisma.post.findMany({
+          where: { appId: auth.appId, deletedAt: null, hiddenAt: null, OR: [{ authorPageId: { in: ids } }, { wallPageId: { in: ids } }] },
+          orderBy: [{ createdAt: 'desc' }], skip: pg * limit, take: limit + 1,
+          include: { author: { select: pageSel } },
+        })
+        has = rows.length > limit
+        items = rows.slice(0, limit)
+      } else if (scope === 'recent') {
+        const rows = await prisma.post.findMany({
+          where: { appId: auth.appId, deletedAt: null, hiddenAt: null },
+          orderBy: [{ createdAt: 'desc' }], skip: pg * limit, take: limit + 1,
+          include: { author: { select: pageSel } },
+        })
+        has = rows.length > limit
+        items = rows.slice(0, limit)
+      } else {
+        // Inicio: mezcla de reciente y relevante. Puntuacion tipo Hacker News
+        // sobre una ventana corta, para que lo que tiene conversacion suba sin
+        // que el feed se congele en los mismos posts de siempre.
+        const days = Math.min(30, Math.max(1, Number(query.days) || 10))
+        const ranked = await prisma.$queryRaw<{ id: number }[]>`
+          SELECT id FROM post
+          WHERE "appId" = ${auth.appId}
+            AND "deletedAt" IS NULL AND "hiddenAt" IS NULL
+            AND "createdAt" > NOW() - (${days} || ' days')::interval
+          ORDER BY (
+            ("likesCount" * 3 + "commentsCount" * 5 + 1)::float
+            / POWER((EXTRACT(EPOCH FROM (NOW() - "createdAt")) / 3600.0) + 2.0, 1.4)
+          ) DESC, "createdAt" DESC
+          LIMIT ${limit + 1} OFFSET ${pg * limit}`
+        const ids = ranked.map((r) => r.id)
+        has = ids.length > limit
+        const keep = ids.slice(0, limit)
+        if (keep.length) {
+          const rows = await prisma.post.findMany({ where: { id: { in: keep } }, include: { author: { select: pageSel } } })
+          const byId = new Map(rows.map((r) => [r.id, r]))
+          items = keep.map((id) => byId.get(id)).filter(Boolean) as any[]
+        }
+        // Si la ventana esta vacia (app recien estrenada), no dejamos el feed en blanco.
+        if (!items.length && pg === 0) {
+          const rows = await prisma.post.findMany({
+            where: { appId: auth.appId, deletedAt: null, hiddenAt: null },
+            orderBy: [{ createdAt: 'desc' }], take: limit + 1, include: { author: { select: pageSel } },
+          })
+          has = rows.length > limit
+          items = rows.slice(0, limit)
+        }
+      }
+
+      const ids = items.map((p) => p.id)
       const [likes, saves] = await Promise.all([likedPosts(auth.appId, viewer, ids), savedPosts(auth.appId, viewer, ids)])
-      return { data: { items: items.map((p) => shapePost(p, likes, saves)), hasMore: has } }
+      const shaped = items.map((p) => shapePost(p, likes, saves))
+
+      // Vistazo rapido: las ultimas respuestas de cada post, sin abrirlo.
+      if (withReplies && ids.length) {
+        const recent = await prisma.$queryRaw<any[]>`
+          SELECT * FROM (
+            SELECT c.id, c."postId", c.content, c."createdAt", c."authorPageId",
+                   ROW_NUMBER() OVER (PARTITION BY c."postId" ORDER BY c."createdAt" DESC) AS rn
+            FROM comment c
+            WHERE c."postId" = ANY(${ids}::int[]) AND c."deletedAt" IS NULL AND c."hiddenAt" IS NULL
+          ) t WHERE t.rn <= 2`
+        const authorIds = [...new Set(recent.map((r) => r.authorPageId))]
+        const authors = authorIds.length
+          ? await prisma.page.findMany({ where: { id: { in: authorIds } }, select: pageSel })
+          : []
+        const byPage = new Map(authors.map((a) => [a.id, a]))
+        const byPost = new Map<number, any[]>()
+        for (const r of recent.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())) {
+          const list = byPost.get(r.postId) || []
+          list.push({ id: r.id, content: r.content, createdAt: r.createdAt, author: shapePage(byPage.get(r.authorPageId)) })
+          byPost.set(r.postId, list)
+        }
+        for (const p of shaped) (p as any).recentComments = byPost.get(p.id) || []
+      }
+
+      return { data: { items: shaped, hasMore: has } }
+    })
+
+    // ---- Mensajeria directa ----
+    // Reglas: puedes ESCRIBIR a alguien solo si tu lo sigues. Y solo puedes
+    // LEER lo que te escriben si tu tambien sigues a esa persona. Asi un
+    // desconocido puede dejarte un mensaje, pero no te invade: no lo ves hasta
+    // que decides seguirlo.
+    .get('/conversations', async ({ auth, query, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      let me: number
+      try { me = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+      const limit = Math.min(50, Number(query.limit) || 20)
+      const pg = Math.max(0, Number(query.page) || 0)
+
+      const rows = await prisma.conversationMember.findMany({
+        where: { pageId: me, archivedAt: null },
+        orderBy: { conversation: { lastMessageAt: 'desc' } },
+        skip: pg * limit, take: limit + 1,
+        include: { conversation: { include: { members: { include: { page: { select: pageSel } } } } } },
+      })
+      const hasMore = rows.length > limit
+      const items = rows.slice(0, limit)
+
+      const otherIds = items.map((r) => r.conversation.members.find((m) => m.pageId !== me)?.pageId).filter(Boolean) as number[]
+      // A quien sigo: define que conversaciones puedo leer.
+      const following = new Set(
+        (await prisma.follow.findMany({ where: { appId: auth.appId, followerPageId: me, followedPageId: { in: otherIds } }, select: { followedPageId: true } }))
+          .map((f) => f.followedPageId),
+      )
+
+      const out = []
+      for (const r of items) {
+        const other = r.conversation.members.find((m) => m.pageId !== me)
+        if (!other) continue
+        const canRead = following.has(other.pageId)
+        const last = canRead
+          ? await prisma.message.findFirst({ where: { conversationId: r.conversationId, deletedAt: null }, orderBy: { createdAt: 'desc' }, select: { content: true, createdAt: true, senderPageId: true } })
+          : null
+        const unread = canRead
+          ? await prisma.message.count({ where: { conversationId: r.conversationId, deletedAt: null, senderPageId: { not: me }, ...(r.lastReadAt ? { createdAt: { gt: r.lastReadAt } } : {}) } })
+          : 0
+        out.push({
+          id: r.conversationId,
+          page: shapePage(other.page),
+          canRead,
+          lastMessage: last ? { content: last.content.slice(0, 140), createdAt: last.createdAt, mine: last.senderPageId === me } : null,
+          lastMessageAt: r.conversation.lastMessageAt,
+          unread,
+        })
+      }
+      return { data: { items: out, hasMore } }
+    })
+
+    // Mensajes de una conversacion (mas recientes primero para paginar hacia atras).
+    .get('/conversations/:id/messages', async ({ auth, params, query, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      let me: number
+      try { me = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+      const conversationId = Number(params.id)
+      const member = await prisma.conversationMember.findUnique({ where: { conversationId_pageId: { conversationId, pageId: me } }, select: { id: true, lastReadAt: true } })
+      if (!member) return { error: 'not_found' }
+      const other = await prisma.conversationMember.findFirst({ where: { conversationId, pageId: { not: me } }, include: { page: { select: pageSel } } })
+      if (!other) return { error: 'not_found' }
+
+      const follows = await prisma.follow.findFirst({ where: { appId: auth.appId, followerPageId: me, followedPageId: other.pageId }, select: { id: true } })
+      if (!follows) return { data: { items: [], hasMore: false, canRead: false, canWrite: false, page: shapePage(other.page) } }
+
+      const limit = Math.min(100, Number(query.limit) || 40)
+      const pg = Math.max(0, Number(query.page) || 0)
+      const rows = await prisma.message.findMany({
+        where: { conversationId, deletedAt: null },
+        orderBy: { createdAt: 'desc' }, skip: pg * limit, take: limit + 1,
+        select: { id: true, content: true, media: true, createdAt: true, senderPageId: true },
+      })
+      const hasMore = rows.length > limit
+      const items = rows.slice(0, limit).reverse().map((m) => ({ id: m.id, content: m.content, media: m.media, createdAt: m.createdAt, mine: m.senderPageId === me }))
+
+      if (pg === 0) await prisma.conversationMember.update({ where: { id: member.id }, data: { lastReadAt: new Date() } }).catch(() => {})
+      return { data: { items, hasMore, canRead: true, canWrite: true, page: shapePage(other.page) } }
+    })
+
+    // Enviar mensaje a una page por handle. Crea la conversacion si hace falta.
+    .post('/messages', async ({ auth, body, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      if (!requireScope(auth, 'comment:write')) return { error: 'insufficient_scope' }
+      let me: number
+      try { me = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+      if (auth.mode === 'page' && !rateLimit(`dm:${me}`, 60, 60_000)) return { error: 'rate_limited' }
+
+      const target = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: String(body.handle).toLowerCase() } }, select: { id: true, type: true } })
+      if (!target) return { error: 'page_not_found' }
+      if (target.id === me) return { error: 'cannot_message_self' }
+
+      // Solo puedes escribir a quien sigues.
+      const follows = await prisma.follow.findFirst({ where: { appId: auth.appId, followerPageId: me, followedPageId: target.id }, select: { id: true } })
+      if (!follows) return { error: 'must_follow_first' }
+
+      const content = String(body.content || '').trim().slice(0, 4000)
+      if (!content) return { error: 'empty_message' }
+
+      const [a, b] = me < target.id ? [me, target.id] : [target.id, me]
+      let conv = await prisma.conversation.findUnique({ where: { appId_pageAId_pageBId: { appId: auth.appId, pageAId: a, pageBId: b } }, select: { id: true } })
+      if (!conv) {
+        conv = await prisma.conversation.create({
+          data: { appId: auth.appId, pageAId: a, pageBId: b, members: { create: [{ pageId: a }, { pageId: b }] } },
+          select: { id: true },
+        })
+      }
+      const msg = await prisma.message.create({ data: { appId: auth.appId, conversationId: conv.id, senderPageId: me, content, media: body.media ?? undefined }, select: { id: true, content: true, media: true, createdAt: true } })
+      await prisma.conversation.update({ where: { id: conv.id }, data: { lastMessageAt: msg.createdAt } }).catch(() => {})
+      return { data: { ...msg, mine: true, conversationId: conv.id } }
+    }, { body: t.Object({ handle: t.String(), content: t.String(), media: t.Optional(t.Any()) }) })
+
+    // Sondeo ligero para el widget flotante: cuantos mensajes sin leer hay y
+    // cual fue el ultimo movimiento (para no recargar listas sin necesidad).
+    .get('/messages/unread', async ({ auth, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      let me: number
+      try { me = await actingPage(auth, request.headers) } catch { return { data: { total: 0, lastMessageAt: null } } }
+      const members = await prisma.conversationMember.findMany({
+        where: { pageId: me, archivedAt: null },
+        select: { conversationId: true, lastReadAt: true, conversation: { select: { lastMessageAt: true, pageAId: true, pageBId: true } } },
+      })
+      if (!members.length) return { data: { total: 0, lastMessageAt: null } }
+      const others = members.map((m) => (m.conversation.pageAId === me ? m.conversation.pageBId : m.conversation.pageAId))
+      const following = new Set(
+        (await prisma.follow.findMany({ where: { appId: auth.appId, followerPageId: me, followedPageId: { in: others } }, select: { followedPageId: true } }))
+          .map((f) => f.followedPageId),
+      )
+      let total = 0
+      let lastMessageAt: Date | null = null
+      for (const m of members) {
+        const other = m.conversation.pageAId === me ? m.conversation.pageBId : m.conversation.pageAId
+        if (!following.has(other)) continue
+        if (!lastMessageAt || m.conversation.lastMessageAt > lastMessageAt) lastMessageAt = m.conversation.lastMessageAt
+        total += await prisma.message.count({ where: { conversationId: m.conversationId, deletedAt: null, senderPageId: { not: me }, ...(m.lastReadAt ? { createdAt: { gt: m.lastReadAt } } : {}) } })
+      }
+      return { data: { total, lastMessageAt } }
     })
 
     // ---- Comments ----

@@ -63,6 +63,7 @@ model Page {
   externalId    String?   @db.VarChar(256) // id del usuario/entidad en la app del consumidor
   displayName   String?   @db.VarChar(200)
   avatarUrl     String?
+  bannerUrl     String?
   bio           String?   @db.VarChar(600)
   metadata      Json?
   followersCount Int      @default(0)
@@ -76,6 +77,8 @@ model Page {
   authoredPosts Post[]    @relation("PostAuthor")
   wallPosts     Post[]    @relation("PostWall")
   comments      Comment[]
+  memberships   ConversationMember[]
+  sentMessages  Message[]
 
   @@unique([appId, handle])
   @@unique([appId, externalId])
@@ -206,4 +209,53 @@ model Save {
   @@unique([appId, postId, pageId])
   @@index([appId, pageId, createdAt])
   @@map("save")
+}
+
+// ---- Mensajeria directa ----
+// Una conversacion 1 a 1 entre dos pages. La clave es la pareja ordenada, para
+// que no se dupliquen conversaciones segun quien escriba primero.
+model Conversation {
+  id            Int      @id @default(autoincrement())
+  appId         Int
+  pageAId       Int
+  pageBId       Int
+  lastMessageAt DateTime @default(now()) @db.Timestamp(6)
+  createdAt     DateTime @default(now()) @db.Timestamp(6)
+  members       ConversationMember[]
+  messages      Message[]
+
+  @@unique([appId, pageAId, pageBId])
+  @@index([appId, lastMessageAt])
+  @@map("conversation")
+}
+
+model ConversationMember {
+  id             Int          @id @default(autoincrement())
+  conversationId Int
+  pageId         Int
+  lastReadAt     DateTime?    @db.Timestamp(6)
+  archivedAt     DateTime?    @db.Timestamp(6)
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  page           Page         @relation(fields: [pageId], references: [id], onDelete: Cascade)
+
+  @@unique([conversationId, pageId])
+  @@index([pageId])
+  @@map("conversation_member")
+}
+
+model Message {
+  id             Int          @id @default(autoincrement())
+  appId          Int
+  conversationId Int
+  senderPageId   Int
+  content        String       @db.Text
+  media          Json?
+  deletedAt      DateTime?
+  createdAt      DateTime     @default(now()) @db.Timestamp(6)
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender         Page         @relation(fields: [senderPageId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+  @@index([appId, createdAt])
+  @@map("message")
 }
