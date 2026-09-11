@@ -52,7 +52,7 @@ export function createHilos(opts: HilosOptions) {
     feed: (opt: { scope?: 'following' | 'foryou'; page?: number; limit?: number } = {}): Promise<Paged<HilosPost>> => req('GET', `/feed?scope=${opt.scope || 'foryou'}&page=${opt.page || 0}&limit=${opt.limit || 20}`),
     comments: {
       list: (postId: number): Promise<HilosComment[]> => req('GET', `/posts/${postId}/comments`),
-      create: (postId: number, p: { content: string; parentCommentId?: number; createdAt?: string }, acting?: string | number): Promise<HilosComment> => req('POST', `/posts/${postId}/comments`, p, acting),
+      create: (postId: number, p: { content: string; parentCommentId?: number; parentExternalRef?: string; externalRef?: string; createdAt?: string }, acting?: string | number): Promise<HilosComment> => req('POST', `/posts/${postId}/comments`, p, acting),
       remove: (id: number, acting?: string | number): Promise<{ ok: boolean }> => req('DELETE', `/comments/${id}`, undefined, acting),
     },
   }

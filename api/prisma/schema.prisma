@@ -121,6 +121,7 @@ model Post {
 model Comment {
   id              Int       @id @default(autoincrement())
   appId           Int
+  externalRef     String?   @db.VarChar(120)
   postId          Int
   authorPageId    Int
   parentCommentId Int?
@@ -136,6 +137,7 @@ model Comment {
   parent          Comment?  @relation("CommentReplies", fields: [parentCommentId], references: [id], onDelete: Cascade)
   replies         Comment[] @relation("CommentReplies")
 
+  @@unique([appId, externalRef])
   @@index([appId, postId, createdAt])
   @@map("comment")
 }
