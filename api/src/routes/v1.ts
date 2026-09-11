@@ -74,6 +74,46 @@ async function isMuted(pageId: number): Promise<boolean> {
   return new Date(until) > new Date()
 }
 
+// Ordenaciones disponibles en las listas. 'reciente' es el valor por defecto
+// en casi todo: lo último es lo que la gente viene a ver.
+type SortKey = 'reciente' | 'antiguo' | 'popular' | 'comentado' | 'menos_popular' | 'menos_comentado'
+const SORTS: SortKey[] = ['reciente', 'antiguo', 'popular', 'comentado', 'menos_popular', 'menos_comentado']
+const asSort = (v: any, fallback: SortKey = 'reciente'): SortKey => (SORTS.includes(String(v) as SortKey) ? (String(v) as SortKey) : fallback)
+
+function postOrder(sort: SortKey): any[] {
+  switch (sort) {
+    case 'antiguo': return [{ createdAt: 'asc' }]
+    case 'popular': return [{ likesCount: 'desc' }, { createdAt: 'desc' }]
+    case 'menos_popular': return [{ likesCount: 'asc' }, { createdAt: 'desc' }]
+    case 'comentado': return [{ commentsCount: 'desc' }, { createdAt: 'desc' }]
+    case 'menos_comentado': return [{ commentsCount: 'asc' }, { createdAt: 'desc' }]
+    default: return [{ createdAt: 'desc' }]
+  }
+}
+
+// Los comentarios no tienen respuestas contadas: los "menos/mas comentados"
+// se resuelven por me gusta, que es la senal real de un comentario.
+// En el directorio, "popular" son seguidores y "comentado" son publicaciones.
+function directoryOrder(sort: SortKey): any[] {
+  switch (sort) {
+    case 'reciente': return [{ createdAt: 'desc' }]
+    case 'antiguo': return [{ createdAt: 'asc' }]
+    case 'popular': return [{ followersCount: 'desc' }, { postsCount: 'desc' }]
+    case 'menos_popular': return [{ followersCount: 'asc' }, { postsCount: 'asc' }]
+    case 'menos_comentado': return [{ postsCount: 'asc' }, { followersCount: 'asc' }]
+    default: return [{ postsCount: 'desc' }, { followersCount: 'desc' }]
+  }
+}
+
+function commentOrder(sort: SortKey): any[] {
+  switch (sort) {
+    case 'antiguo': return [{ createdAt: 'asc' }]
+    case 'popular': case 'comentado': return [{ likesCount: 'desc' }, { createdAt: 'desc' }]
+    case 'menos_popular': case 'menos_comentado': return [{ likesCount: 'asc' }, { createdAt: 'asc' }]
+    default: return [{ createdAt: 'desc' }]
+  }
+}
+
 async function savedPosts(appId: number, pageId: number | null | undefined, postIds: number[]): Promise<Set<number>> {
   if (!pageId || !postIds.length) return new Set()
   const r = await prisma.save.findMany({ where: { appId, pageId, postId: { in: postIds } }, select: { postId: true } })
@@ -408,7 +448,7 @@ export const v1 = () =>
       if (q) where.OR = [{ displayName: { contains: q, mode: 'insensitive' } }, { handle: { contains: q.toLowerCase() } }]
       const rows = await prisma.page.findMany({
         where,
-        orderBy: [{ postsCount: 'desc' }, { followersCount: 'desc' }, { id: 'asc' }],
+        orderBy: [...directoryOrder(asSort(query.sort, 'comentado')), { id: 'asc' }],
         skip: page * limit, take: limit + 1, select: pageSel,
       })
       const hasMore = rows.length > limit
@@ -495,7 +535,7 @@ export const v1 = () =>
       if (only === 'wall') where.wallPageId = page.id
       else if (only === 'authored') where.authorPageId = page.id
       else where.OR = [{ authorPageId: page.id }, { wallPageId: page.id }]
-      const rows = await prisma.post.findMany({ where, orderBy: [{ pinned: 'desc' }, { createdAt: 'desc' }], skip: pg * limit, take: limit + 1, include: { author: { select: pageSel }, wall: { select: wallSel } } })
+      const rows = await prisma.post.findMany({ where, orderBy: [{ pinned: 'desc' }, ...postOrder(asSort(query.sort))], skip: pg * limit, take: limit + 1, include: { author: { select: pageSel }, wall: { select: wallSel } } })
       const has = rows.length > limit, items = rows.slice(0, limit)
       const ids = items.map((p) => p.id)
       const viewer = await viewerPage(auth, request.headers)
@@ -587,7 +627,7 @@ export const v1 = () =>
         const ids = [...f.map((x) => x.followedPageId), viewer]
         const rows = await prisma.post.findMany({
           where: { appId: auth.appId, deletedAt: null, hiddenAt: null, OR: [{ authorPageId: { in: ids } }, { wallPageId: { in: ids } }] },
-          orderBy: [{ createdAt: 'desc' }], skip: pg * limit, take: limit + 1,
+          orderBy: postOrder(asSort(query.sort)), skip: pg * limit, take: limit + 1,
           include: { author: { select: pageSel }, wall: { select: wallSel } },
         })
         has = rows.length > limit
@@ -595,7 +635,7 @@ export const v1 = () =>
       } else if (scope === 'recent') {
         const rows = await prisma.post.findMany({
           where: { appId: auth.appId, deletedAt: null, hiddenAt: null },
-          orderBy: [{ createdAt: 'desc' }], skip: pg * limit, take: limit + 1,
+          orderBy: postOrder(asSort(query.sort)), skip: pg * limit, take: limit + 1,
           include: { author: { select: pageSel }, wall: { select: wallSel } },
         })
         has = rows.length > limit
@@ -855,9 +895,12 @@ export const v1 = () =>
       const paged = query.page !== undefined || query.limit !== undefined
       const limit = Math.min(200, Math.max(1, Number(query.limit) || 100))
       const pg = Math.max(0, Number(query.page) || 0)
+      // Por defecto, lo último primero. Las respuestas de cada hilo se ordenan
+      // luego en el cliente de forma cronológica, que es como se leen.
+      const sort = asSort(query.sort)
       const rows = await prisma.comment.findMany({
         where,
-        orderBy: { createdAt: 'asc' },
+        orderBy: commentOrder(sort),
         skip: paged ? pg * limit : 0,
         take: paged ? limit + 1 : 200,
         include: { author: { select: pageSel } },
