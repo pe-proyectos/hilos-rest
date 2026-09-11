@@ -672,6 +672,32 @@ export const v1 = () =>
       return { data: shapePost(p, likes, saves) }
     })
 
+    .patch('/posts/:id', async ({ auth, params, body, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const post = await prisma.post.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, select: { id: true, authorPageId: true } })
+      if (!post) return { error: 'not_found' }
+      if (auth.mode !== 'secret') {
+        if (!requireScope(auth, 'post:write')) return { error: 'insufficient_scope' }
+        let me: number
+        try { me = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+        if (me !== post.authorPageId) return { error: 'forbidden' }
+      }
+      const data: any = {}
+      if (body.content !== undefined) {
+        const content = String(body.content).trim().slice(0, MAX_CONTENT)
+        if (!content) return { error: 'empty_post' }
+        data.content = content
+      }
+      if (body.wallExternalId) {
+        const wall = await prisma.page.findUnique({ where: { appId_externalId: { appId: auth.appId, externalId: String(body.wallExternalId) } }, select: { id: true } })
+        if (!wall) return { error: 'wall_not_found' }
+        data.wallPageId = wall.id
+      }
+      if (!Object.keys(data).length) return { error: 'nothing_to_update' }
+      const up = await prisma.post.update({ where: { id: post.id }, data, include: { author: { select: pageSel }, wall: { select: wallSel } } })
+      return { data: shapePost(up) }
+    }, { body: t.Object({ content: t.Optional(t.String()), wallExternalId: t.Optional(t.String()) }) })
+
     .delete('/posts/:id', async ({ auth, params, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
       const p = await prisma.post.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, select: { id: true, authorPageId: true } })
