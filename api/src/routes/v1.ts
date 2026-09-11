@@ -248,12 +248,34 @@ export const v1 = () =>
         const f = await prisma.follow.findMany({ where: { appId: auth.appId, followerPageId: auth.pageId }, select: { followedPageId: true } })
         excludeIds = [...f.map((x) => x.followedPageId), auth.pageId]
       }
+      const type = String(query.type || '')
+      const types = type === 'user' ? ['user'] : type === 'scan' ? ['scan'] : ['scan', 'user']
       const rows = await prisma.page.findMany({
-        where: { appId: auth.appId, ...(excludeIds.length ? { id: { notIn: excludeIds } } : {}), type: { in: ['scan', 'user'] }, postsCount: { gt: 0 } },
-        orderBy: [{ followersCount: 'desc' }, { postsCount: 'desc' }],
+        where: { appId: auth.appId, ...(excludeIds.length ? { id: { notIn: excludeIds } } : {}), type: { in: types } },
+        orderBy: [{ followersCount: 'desc' }, { postsCount: 'desc' }, { id: 'asc' }],
         take: limit, select: pageSel,
       })
       return { data: rows.map(shapePage) }
+    })
+
+    .get('/pages/:handle/followers', async ({ auth, params, query }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const page = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: params.handle } }, select: { id: true } })
+      if (!page) return { error: 'not_found' }
+      const limit = Math.min(50, Number(query.limit) || 30)
+      const rows = await prisma.follow.findMany({ where: { appId: auth.appId, followedPageId: page.id }, orderBy: { createdAt: 'desc' }, take: limit, select: { followerPageId: true } })
+      const pages = await prisma.page.findMany({ where: { id: { in: rows.map((r) => r.followerPageId) } }, select: pageSel })
+      return { data: pages.map(shapePage) }
+    })
+
+    .get('/pages/:handle/following', async ({ auth, params, query }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const page = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: params.handle } }, select: { id: true } })
+      if (!page) return { error: 'not_found' }
+      const limit = Math.min(50, Number(query.limit) || 30)
+      const rows = await prisma.follow.findMany({ where: { appId: auth.appId, followerPageId: page.id }, orderBy: { createdAt: 'desc' }, take: limit, select: { followedPageId: true } })
+      const pages = await prisma.page.findMany({ where: { id: { in: rows.map((r) => r.followedPageId) } }, select: pageSel })
+      return { data: pages.map(shapePage) }
     })
 
     .get('/pages/:handle/posts', async ({ auth, params, query }: any) => {
