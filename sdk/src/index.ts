@@ -56,6 +56,8 @@ export function createHilos(opts: HilosOptions) {
       list: (postId: number): Promise<HilosComment[]> => req('GET', `/posts/${postId}/comments`),
       create: (postId: number, p: { content: string; parentCommentId?: number; parentExternalRef?: string; externalRef?: string; createdAt?: string }, acting?: string | number): Promise<HilosComment> => req('POST', `/posts/${postId}/comments`, p, acting),
       remove: (id: number, acting?: string | number): Promise<{ ok: boolean }> => req('DELETE', `/comments/${id}`, undefined, acting),
+      like: (id: number, acting?: string | number): Promise<{ liked: boolean; likesCount: number }> => req('POST', `/comments/${id}/like`, undefined, acting),
+      hide: (id: number, hidden = true): Promise<{ id: number; hidden: boolean }> => req('POST', `/comments/${id}/hide`, { hidden }),
     },
   }
 }

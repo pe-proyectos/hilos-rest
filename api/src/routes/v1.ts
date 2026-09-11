@@ -70,6 +70,16 @@ export const v1 = () =>
     }, { body: t.Object({ confirm: t.String() }) })
 
     // Config del App (origenes permitidos para page tokens). Admin.
+    // Emite una publishable key nueva para la app (lectura publica desde el
+    // navegador). Protegido por el token de bootstrap.
+    .post('/admin/publishable-key', async ({ auth, request, body }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      if (!process.env.HILOS_BOOTSTRAP_TOKEN || request.headers.get('x-bootstrap-token') !== process.env.HILOS_BOOTSTRAP_TOKEN) return { error: 'forbidden' }
+      const pk = generateApiKey('publishable')
+      await prisma.apiKey.create({ data: { appId: auth.appId, label: String(body?.label || 'client'), type: 'publishable', prefix: pk.prefix, keyHash: pk.hash } })
+      return { data: { publishableKey: pk.full } }
+    }, { body: t.Optional(t.Object({ label: t.Optional(t.String()) })) })
+
     .post('/admin/app-config', async ({ auth, request, body }: any) => {
       if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
       if (!process.env.HILOS_BOOTSTRAP_TOKEN || request.headers.get('x-bootstrap-token') !== process.env.HILOS_BOOTSTRAP_TOKEN) return { error: 'forbidden' }
