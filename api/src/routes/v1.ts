@@ -509,7 +509,7 @@ export const v1 = () =>
     })
 
     // ---- Comments ----
-    .get('/posts/:id/comments', async ({ auth, params, query }: any) => {
+    .get('/posts/:id/comments', async ({ auth, params, query, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
       const postId = Number(params.id)
       const where = { appId: auth.appId, postId, deletedAt: null, hiddenAt: null }
@@ -525,9 +525,21 @@ export const v1 = () =>
         include: { author: { select: pageSel } },
       })
       const hasMore = paged && rows.length > limit
-      const items = (paged ? rows.slice(0, limit) : rows).map((c) => ({
+      const shown = paged ? rows.slice(0, limit) : rows
+      // Que el espectador vea sus propios me gusta al cargar.
+      const viewer = await viewerPage(auth, request.headers)
+      let likedSet = new Set<number>()
+      if (viewer && shown.length) {
+        const r = await prisma.reaction.findMany({
+          where: { appId: auth.appId, pageId: viewer, type: 'like', targetType: 'comment', targetId: { in: shown.map((c) => c.id) } },
+          select: { targetId: true },
+        })
+        likedSet = new Set(r.map((x) => x.targetId))
+      }
+      const items = shown.map((c) => ({
         id: c.id, content: c.content, parentCommentId: c.parentCommentId,
-        likesCount: c.likesCount, createdAt: c.createdAt, author: shapePage(c.author),
+        likesCount: c.likesCount, liked: viewer ? likedSet.has(c.id) : undefined,
+        createdAt: c.createdAt, author: shapePage(c.author),
       }))
       // Sin parametros mantenemos la forma antigua (array) por compatibilidad.
       if (!paged) return { data: items }
@@ -568,6 +580,41 @@ export const v1 = () =>
       await prisma.post.update({ where: { id: c.postId }, data: { commentsCount: { decrement: 1 } } }).catch(() => {})
       return { data: { ok: true } }
     })
+
+    // Me gusta en comentarios (paridad con el lector de CapibaraTraductor).
+    .post('/comments/:id/like', async ({ auth, params, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      if (!requireScope(auth, 'react')) return { error: 'insufficient_scope' }
+      let pageId: number
+      try { pageId = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+      if (auth.mode === 'page' && !rateLimit(`clike:${pageId}`, 120, 60_000)) return { error: 'rate_limited' }
+      const id = Number(params.id)
+      const c = await prisma.comment.findFirst({ where: { id, appId: auth.appId, deletedAt: null }, select: { id: true } })
+      if (!c) return { error: 'not_found' }
+      const key = { appId_targetType_targetId_pageId_type: { appId: auth.appId, targetType: 'comment', targetId: id, pageId, type: 'like' } }
+      const existing = await prisma.reaction.findUnique({ where: key })
+      if (existing) {
+        await prisma.reaction.delete({ where: { id: existing.id } })
+        const u = await prisma.comment.update({ where: { id }, data: { likesCount: { decrement: 1 } }, select: { likesCount: true } })
+        return { data: { liked: false, likesCount: Math.max(0, u.likesCount) } }
+      }
+      await prisma.reaction.create({ data: { appId: auth.appId, targetType: 'comment', targetId: id, pageId, type: 'like' } })
+      const u = await prisma.comment.update({ where: { id }, data: { likesCount: { increment: 1 } }, select: { likesCount: true } })
+      return { data: { liked: true, likesCount: u.likesCount } }
+    })
+
+    // Moderacion: ocultar o restaurar un comentario. Solo con secret key, es
+    // decir desde el backend de la app, que es quien valida los permisos del
+    // staff. Es reversible: nunca borramos el contenido.
+    .post('/comments/:id/hide', async ({ auth, params, body }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      const id = Number(params.id)
+      const c = await prisma.comment.findFirst({ where: { id, appId: auth.appId }, select: { id: true, hiddenAt: true } })
+      if (!c) return { error: 'not_found' }
+      const hidden = body?.hidden === false ? false : true
+      await prisma.comment.update({ where: { id }, data: { hiddenAt: hidden ? new Date() : null } })
+      return { data: { id, hidden } }
+    }, { body: t.Optional(t.Object({ hidden: t.Optional(t.Boolean()) })) })
 
     // ---- Reactions & Follows ----
     .post('/posts/:id/like', async ({ auth, params, request }: any) => {
