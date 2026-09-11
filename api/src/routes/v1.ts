@@ -292,6 +292,36 @@ export const v1 = () =>
       return { data: { uploadUrl, key, publicUrl: `${R2_PUBLIC}/${key}`, expiresIn: 900 } }
     }, { body: t.Object({ filename: t.Optional(t.String()), contentType: t.Optional(t.String()) }) })
 
+    // Subida directa a través del motor. R2 no acepta PUT desde el navegador
+    // sin reglas CORS propias, y esas reglas no las controla cada app: así que
+    // el archivo entra por aquí y hilos lo guarda.
+    .post('/uploads/direct', async ({ auth, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      if (auth.mode === 'page' && !(requireScope(auth, 'post:write') || requireScope(auth, 'comment:write'))) return { error: 'insufficient_scope' }
+      const c = s3(); if (!c) return { error: 'storage_not_configured' }
+
+      let file: any = null
+      try {
+        const form = await request.formData()
+        file = form.get('file')
+      } catch { return { error: 'invalid_form' } }
+      if (!file || typeof file === 'string') return { error: 'no_file' }
+
+      const type = String(file.type || 'application/octet-stream')
+      if (!type.startsWith('image/')) return { error: 'only_images' }
+      if (file.size > 8 * 1024 * 1024) return { error: 'file_too_large' }
+
+      const name = String(file.name || 'file').replace(/[^a-zA-Z0-9._-]/g, '_').slice(-60)
+      const key = `${auth.appId}/media/${Date.now()}-${randomBytes(6).toString('hex')}-${name}`
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer())
+        await c.write(key, bytes, { type })
+        return { data: { key, publicUrl: `${R2_PUBLIC}/${key}` } }
+      } catch (e: any) {
+        return { error: 'upload_failed' }
+      }
+    })
+
     // Bootstrap unico: crea el dev+app+keys si no existe ninguna app todavia.
     // Protegido por HILOS_BOOTSTRAP_TOKEN; inerte tras el primer uso.
     .post('/bootstrap', async ({ request, body }: any) => {
