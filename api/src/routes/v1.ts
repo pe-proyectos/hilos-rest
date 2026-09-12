@@ -1192,6 +1192,64 @@ export const v1 = () =>
       return { data: { handle: String(params.handle).toLowerCase(), muted, until: meta.mutedUntil ?? null } }
     }, { body: t.Optional(t.Object({ muted: t.Optional(t.Boolean()), until: t.Optional(t.String()) })) })
 
+    // Moderación: comentarios de todo lo que cuelga de una page (un scan y sus
+    // obras). Solo con secret key: la app es quien sabe si quien pregunta es
+    // staff de ese scan.
+    .get('/moderation/comments', async ({ auth, query }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      const handle = String(query.page || '').toLowerCase()
+      if (!handle) return { error: 'page_required' }
+
+      const root = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle } }, select: { id: true } })
+      if (!root) return { error: 'not_found' }
+
+      // La page del scan y todas sus obras.
+      const children = await prisma.page.findMany({ where: { appId: auth.appId, parentPageId: root.id }, select: { id: true } })
+      const pageIds = [root.id, ...children.map((c) => c.id)]
+
+      const limit = Math.min(100, Math.max(1, Number(query.limit) || 30))
+      const pg = Math.max(0, Number(query.page_num) || 0)
+      const status = String(query.status || 'all')
+
+      const where: any = {
+        appId: auth.appId,
+        post: { OR: [{ wallPageId: { in: pageIds } }, { authorPageId: { in: pageIds } }] },
+      }
+      if (status === 'hidden') { where.hiddenAt = { not: null }; where.deletedAt = null }
+      else if (status === 'deleted') where.deletedAt = { not: null }
+      else if (status === 'active') { where.hiddenAt = null; where.deletedAt = null }
+      else where.deletedAt = null
+      if (query.q) where.content = { contains: String(query.q), mode: 'insensitive' }
+
+      const [rows, total, hidden] = await Promise.all([
+        prisma.comment.findMany({
+          where, orderBy: { createdAt: 'desc' }, skip: pg * limit, take: limit + 1,
+          include: {
+            author: { select: pageSel },
+            post: { select: { id: true, content: true, externalRef: true, wall: { select: { handle: true, displayName: true } } } },
+          },
+        }),
+        prisma.comment.count({ where: { appId: auth.appId, deletedAt: null, post: { OR: [{ wallPageId: { in: pageIds } }, { authorPageId: { in: pageIds } }] } } }),
+        prisma.comment.count({ where: { appId: auth.appId, deletedAt: null, hiddenAt: { not: null }, post: { OR: [{ wallPageId: { in: pageIds } }, { authorPageId: { in: pageIds } }] } } }),
+      ])
+
+      const hasMore = rows.length > limit
+      return {
+        data: {
+          items: rows.slice(0, limit).map((c) => ({
+            id: c.id, content: c.content, createdAt: c.createdAt,
+            likesCount: c.likesCount, parentCommentId: c.parentCommentId,
+            hidden: !!c.hiddenAt, deleted: !!c.deletedAt,
+            author: shapePage(c.author),
+            post: c.post ? { id: c.post.id, title: c.post.content?.slice(0, 90) || '', externalRef: c.post.externalRef, wall: c.post.wall } : null,
+          })),
+          hasMore,
+          total,
+          hidden,
+        },
+      }
+    })
+
     // ---- Reactions & Follows ----
     .post('/posts/:id/like', async ({ auth, params, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
