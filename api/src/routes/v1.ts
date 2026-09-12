@@ -212,6 +212,65 @@ export const v1 = () =>
       return { data: { publishableKey: pk.full } }
     }, { body: t.Optional(t.Object({ label: t.Optional(t.String()) })) })
 
+    // Radiografía de la app: cuánta gente, cuánto se publica y cuánto se habla.
+    .get('/admin/stats', async ({ auth, request }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      if (!process.env.HILOS_BOOTSTRAP_TOKEN || request.headers.get('x-bootstrap-token') !== process.env.HILOS_BOOTSTRAP_TOKEN) return { error: 'forbidden' }
+      const appId = auth.appId
+      const desde = (dias: number) => new Date(Date.now() - dias * 86400000)
+
+      const [
+        pages, usuarios, scans, obras,
+        posts, postsPropios, comentarios, likes, guardados, seguimientos,
+        conversaciones, mensajes, avisos,
+        posts7, comentarios7, likes7, seguimientos7, usuarios7, mensajes7,
+        posts1, comentarios1, usuarios1,
+      ] = await Promise.all([
+        prisma.page.count({ where: { appId } }),
+        prisma.page.count({ where: { appId, type: 'user' } }),
+        prisma.page.count({ where: { appId, type: 'scan' } }),
+        prisma.page.count({ where: { appId, type: 'manga' } }),
+        prisma.post.count({ where: { appId, deletedAt: null } }),
+        prisma.post.count({ where: { appId, deletedAt: null, externalRef: null } }),
+        prisma.comment.count({ where: { appId, deletedAt: null } }),
+        prisma.reaction.count({ where: { appId, type: 'like' } }),
+        prisma.save.count({ where: { appId } }),
+        prisma.follow.count({ where: { appId } }),
+        prisma.conversation.count({ where: { appId } }),
+        prisma.message.count({ where: { appId, deletedAt: null } }),
+        prisma.notification.count({ where: { appId } }),
+        prisma.post.count({ where: { appId, deletedAt: null, createdAt: { gte: desde(7) } } }),
+        prisma.comment.count({ where: { appId, deletedAt: null, createdAt: { gte: desde(7) } } }),
+        prisma.reaction.count({ where: { appId, type: 'like', createdAt: { gte: desde(7) } } }),
+        prisma.follow.count({ where: { appId, createdAt: { gte: desde(7) } } }),
+        prisma.page.count({ where: { appId, type: 'user', createdAt: { gte: desde(7) } } }),
+        prisma.message.count({ where: { appId, deletedAt: null, createdAt: { gte: desde(7) } } }),
+        prisma.post.count({ where: { appId, deletedAt: null, createdAt: { gte: desde(1) } } }),
+        prisma.comment.count({ where: { appId, deletedAt: null, createdAt: { gte: desde(1) } } }),
+        prisma.page.count({ where: { appId, type: 'user', createdAt: { gte: desde(1) } } }),
+      ])
+
+      // Cuentas que han hecho algo (publicar o comentar) en la última semana.
+      const activos = await prisma.$queryRaw<{ n: bigint }[]>`
+        SELECT count(DISTINCT autor) AS n FROM (
+          SELECT "authorPageId" AS autor FROM post
+          WHERE "appId" = ${appId} AND "deletedAt" IS NULL AND "createdAt" > NOW() - interval '7 days'
+          UNION
+          SELECT "authorPageId" AS autor FROM comment
+          WHERE "appId" = ${appId} AND "deletedAt" IS NULL AND "createdAt" > NOW() - interval '7 days'
+        ) t`
+
+      return {
+        data: {
+          pages: { total: pages, usuarios, scans, obras },
+          contenido: { posts, postsPropios, comentarios, likes, guardados, seguimientos },
+          mensajeria: { conversaciones, mensajes, avisos },
+          semana: { posts: posts7, comentarios: comentarios7, likes: likes7, seguimientos: seguimientos7, usuariosNuevos: usuarios7, mensajes: mensajes7, cuentasActivas: Number(activos[0]?.n || 0) },
+          hoy: { posts: posts1, comentarios: comentarios1, usuariosNuevos: usuarios1 },
+        },
+      }
+    })
+
     .post('/admin/webhook', async ({ auth, request, body }: any) => {
       if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
       if (!process.env.HILOS_BOOTSTRAP_TOKEN || request.headers.get('x-bootstrap-token') !== process.env.HILOS_BOOTSTRAP_TOKEN) return { error: 'forbidden' }
