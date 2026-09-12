@@ -1197,10 +1197,13 @@ export const v1 = () =>
     // staff de ese scan.
     .get('/moderation/comments', async ({ auth, query }: any) => {
       if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
-      const handle = String(query.page || '').toLowerCase()
-      if (!handle) return { error: 'page_required' }
-
-      const root = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle } }, select: { id: true } })
+      // Se admite handle o 'external:<id>': el externalId es estable aunque la
+      // app renombre la page.
+      const ref = String(query.page || '').trim()
+      if (!ref) return { error: 'page_required' }
+      const root = ref.startsWith('external:')
+        ? await prisma.page.findUnique({ where: { appId_externalId: { appId: auth.appId, externalId: ref.slice(9) } }, select: { id: true } })
+        : await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: ref.toLowerCase() } }, select: { id: true } })
       if (!root) return { error: 'not_found' }
 
       // La page del scan y todas sus obras.
