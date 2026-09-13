@@ -120,6 +120,14 @@ model Post {
   comments      Comment[]
   hashtags      Hashtag[]
   saves         Save[]
+  poll          PostPoll?
+  // Publicación programada: el contenido queda guardado cifrado y el servidor
+  // no lo entrega hasta que llega la hora.
+  revealAt      DateTime? @db.Timestamp(6)
+  secretContent String?   @db.Text
+  // Cuenta atrás hacia una fecha (un estreno, un capítulo).
+  countdownAt    DateTime? @db.Timestamp(6)
+  countdownLabel String?   @db.VarChar(120)
 
   @@unique([appId, externalRef])
   @@index([appId, wallPageId, createdAt])
@@ -303,4 +311,33 @@ model PageMember {
   @@unique([pageId, memberPageId])
   @@index([appId, memberPageId])
   @@map("page_member")
+}
+
+// Encuesta adjunta a una publicación.
+model PostPoll {
+  id         Int            @id @default(autoincrement())
+  appId      Int
+  postId     Int            @unique
+  options    Json           // ["Opción A", "Opción B", ...]
+  votesCount Int            @default(0)
+  endsAt     DateTime?      @db.Timestamp(6)
+  createdAt  DateTime       @default(now()) @db.Timestamp(6)
+  post       Post           @relation(fields: [postId], references: [id], onDelete: Cascade)
+  votes      PostPollVote[]
+
+  @@index([appId])
+  @@map("post_poll")
+}
+
+model PostPollVote {
+  id          Int      @id @default(autoincrement())
+  pollId      Int
+  pageId      Int
+  optionIndex Int
+  createdAt   DateTime @default(now()) @db.Timestamp(6)
+  poll        PostPoll @relation(fields: [pollId], references: [id], onDelete: Cascade)
+
+  @@unique([pollId, pageId])
+  @@index([pollId])
+  @@map("post_poll_vote")
 }

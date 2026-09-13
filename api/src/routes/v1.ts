@@ -3,6 +3,7 @@ import { prisma } from '../lib/prisma'
 import { resolveAuth, actingPage, viewerPage, requireScope, rateLimit, CLIENT_SCOPES, type AuthCtx } from '../plugins/auth'
 import { signJwt, generateApiKey } from '../lib/crypto'
 import { s3, R2_PUBLIC } from '../lib/s3'
+import { cifrar, descifrar } from '../lib/secret'
 import { randomBytes, createHmac } from 'crypto'
 
 const SECRET = process.env.HILOS_JWT_SECRET || 'dev-secret'
@@ -40,8 +41,27 @@ function shapePage(p: any) {
 }
 const wallSel = { id: true, handle: true, type: true, displayName: true, avatarUrl: true, parentPageId: true, parent: { select: { handle: true, displayName: true } } }
 function shapePost(p: any, likedSet?: Set<number>, savedSet?: Set<number>) {
+  // Contenido programado: hasta la hora señalada no se entrega ni al autor.
+  const oculto = p.revealAt && new Date(p.revealAt) > new Date()
+  const revelado = p.revealAt && !oculto && p.secretContent ? descifrar(p.secretContent) : null
+
   return {
-    id: p.id, content: p.content, media: p.media ?? null, repostOfId: p.repostOfId ?? null, externalRef: p.externalRef ?? null,
+    id: p.id,
+    content: revelado ?? p.content,
+    reveal: p.revealAt ? { at: p.revealAt, locked: !!oculto } : null,
+    countdown: p.countdownAt ? { at: p.countdownAt, label: p.countdownLabel || null } : null,
+    poll: p.poll
+      ? {
+          id: p.poll.id,
+          options: Array.isArray(p.poll.options) ? p.poll.options : [],
+          votesCount: p.poll.votesCount,
+          endsAt: p.poll.endsAt,
+          closed: !!(p.poll.endsAt && new Date(p.poll.endsAt) < new Date()),
+          results: p.__pollResults ?? null,
+          myVote: p.__myVote ?? null,
+        }
+      : null,
+    media: p.media ?? null, repostOfId: p.repostOfId ?? null, externalRef: p.externalRef ?? null,
     likesCount: p.likesCount, commentsCount: p.commentsCount, repostCount: p.repostCount, pinned: p.pinned,
     createdAt: p.createdAt, liked: likedSet ? likedSet.has(p.id) : undefined, saved: savedSet ? savedSet.has(p.id) : undefined,
     author: shapePage(p.author), wallPageId: p.wallPageId,
@@ -185,6 +205,33 @@ async function attachReplies(appId: number, shaped: any[], ids: number[]) {
     list.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
   }
   for (const p of shaped) p.recentComments = byPost.get(p.id) || []
+}
+
+// Resultados de las encuestas de una tanda de posts, y qué votó el espectador.
+async function attachPolls(shaped: any[], rows: any[], viewer: number | null) {
+  const conEncuesta = rows.filter((r) => r.poll)
+  if (!conEncuesta.length) return
+  const pollIds = conEncuesta.map((r) => r.poll.id)
+
+  const conteo = await prisma.postPollVote.groupBy({
+    by: ['pollId', 'optionIndex'],
+    where: { pollId: { in: pollIds } },
+    _count: { optionIndex: true },
+  }).catch(() => [])
+
+  const mios = viewer
+    ? await prisma.postPollVote.findMany({ where: { pollId: { in: pollIds }, pageId: viewer }, select: { pollId: true, optionIndex: true } }).catch(() => [])
+    : []
+  const miVoto = new Map(mios.map((m) => [m.pollId, m.optionIndex]))
+
+  for (const p of shaped) {
+    const fila = rows.find((r) => r.id === p.id)
+    if (!fila?.poll || !p.poll) continue
+    const opciones = Array.isArray(fila.poll.options) ? fila.poll.options : []
+    p.poll.results = opciones.map((_: any, i: number) =>
+      conteo.find((c) => c.pollId === fila.poll.id && c.optionIndex === i)?._count.optionIndex ?? 0)
+    p.poll.myVote = miVoto.has(fila.poll.id) ? miVoto.get(fila.poll.id) : null
+  }
 }
 
 async function savedPosts(appId: number, pageId: number | null | undefined, postIds: number[]): Promise<Set<number>> {
@@ -601,7 +648,7 @@ export const v1 = () =>
         }),
         prisma.post.findMany({
           where: { appId: auth.appId, deletedAt: null, hiddenAt: null, content: { contains: term, mode: 'insensitive' } },
-          orderBy: { createdAt: 'desc' }, take: limit, include: { author: { select: pageSel }, wall: { select: wallSel } },
+          orderBy: { createdAt: 'desc' }, take: limit, include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true },
         }),
       ])
       const viewer = await viewerPage(auth, request.headers)
@@ -624,7 +671,7 @@ export const v1 = () =>
       const hasMore = refs.length > limit
       const ids = refs.slice(0, limit).map((r) => r.postId)
       if (!ids.length) return { data: { items: [], hasMore: false } }
-      const rows = await prisma.post.findMany({ where: { id: { in: ids }, deletedAt: null, hiddenAt: null }, include: { author: { select: pageSel }, wall: { select: wallSel } } })
+      const rows = await prisma.post.findMany({ where: { id: { in: ids }, deletedAt: null, hiddenAt: null }, include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true } })
       rows.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id))
       const viewer = await viewerPage(auth, request.headers)
       const [likes, saves] = await Promise.all([likedPosts(auth.appId, viewer, ids), savedPosts(auth.appId, viewer, ids)])
@@ -732,12 +779,13 @@ export const v1 = () =>
       if (only === 'wall') where.wallPageId = page.id
       else if (only === 'authored') where.authorPageId = page.id
       else where.OR = [{ authorPageId: page.id }, { wallPageId: page.id }]
-      const rows = await prisma.post.findMany({ where, orderBy: [{ pinned: 'desc' }, ...postOrder(asSort(query.sort))], skip: pg * limit, take: limit + 1, include: { author: { select: pageSel }, wall: { select: wallSel } } })
+      const rows = await prisma.post.findMany({ where, orderBy: [{ pinned: 'desc' }, ...postOrder(asSort(query.sort))], skip: pg * limit, take: limit + 1, include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true } })
       const has = rows.length > limit, items = rows.slice(0, limit)
       const ids = items.map((p) => p.id)
       const viewer = await viewerPage(auth, request.headers)
       const [likes, saves] = await Promise.all([likedPosts(auth.appId, viewer, ids), savedPosts(auth.appId, viewer, ids)])
       const shaped = items.map((p) => shapePost(p, likes, saves))
+      await attachPolls(shaped, items, viewer)
       if (query.replies === '1' || query.replies === 'true') await attachReplies(auth.appId, shaped, ids)
       return { data: { items: shaped, hasMore: has } }
     })
@@ -762,20 +810,57 @@ export const v1 = () =>
       }
       // Dedupe por externalRef (auto-post/migracion idempotente).
       if (body.externalRef) {
-        const dup = await prisma.post.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef: String(body.externalRef) } }, include: { author: { select: pageSel }, wall: { select: wallSel } } }).catch(() => null)
+        const dup = await prisma.post.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef: String(body.externalRef) } }, include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true } }).catch(() => null)
         if (dup) return { data: shapePost(dup), deduped: true }
       }
+      // Un mensaje programado se guarda cifrado y con un aviso en su lugar.
+      const revealAt = body.revealAt ? new Date(body.revealAt) : null
+      const programado = revealAt && revealAt > new Date()
+      const contenidoVisible = programado
+        ? String(body.revealPlaceholder || 'Mensaje programado').slice(0, 200)
+        : content
+
       const post = await prisma.post.create({ data: {
-        appId: auth.appId, authorPageId, wallPageId, content, media: body.media ?? undefined,
+        appId: auth.appId, authorPageId, wallPageId,
+        content: contenidoVisible,
+        ...(programado ? { revealAt, secretContent: cifrar(content) } : {}),
+        ...(body.countdownAt ? { countdownAt: new Date(body.countdownAt), countdownLabel: body.countdownLabel ? String(body.countdownLabel).slice(0, 120) : null } : {}),
+        media: body.media ?? undefined,
         repostOfId: body.repostOfId ? Number(body.repostOfId) : null, externalRef: body.externalRef ? String(body.externalRef) : null,
         metadata: body.metadata ?? undefined, createdAt: body.createdAt ? new Date(body.createdAt) : undefined,
-      }, include: { author: { select: pageSel }, wall: { select: wallSel } } })
+      }, include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true } })
       notifyMentions(auth.appId, content, authorPageId, { postId: post.id })
+      // La encuesta se crea con el post: sin post no hay dónde votar.
+      if (Array.isArray(body.poll?.options) && body.poll.options.length >= 2) {
+        const opciones = body.poll.options
+          .map((o: any) => String(o).trim().slice(0, 80))
+          .filter(Boolean)
+          .slice(0, 6)
+        if (opciones.length >= 2) {
+          await prisma.postPoll.create({
+            data: {
+              appId: auth.appId,
+              postId: post.id,
+              options: opciones,
+              endsAt: body.poll.endsAt ? new Date(body.poll.endsAt) : null,
+            },
+          }).catch(() => {})
+        }
+      }
+
       const tags = parseHashtags(content)
       if (tags.length) await prisma.hashtag.createMany({ data: tags.map((tag) => ({ appId: auth.appId, postId: post.id, tag })) }).catch(() => {})
       await prisma.page.update({ where: { id: authorPageId }, data: { postsCount: { increment: 1 } } }).catch(() => {})
       return { data: shapePost(post) }
-    }, { body: t.Object({ content: t.Optional(t.String()), media: t.Optional(t.Any()), wallHandle: t.Optional(t.String()), wallExternalId: t.Optional(t.Union([t.String(), t.Number()])), wallPageId: t.Optional(t.Union([t.String(), t.Number()])), repostOfId: t.Optional(t.Union([t.String(), t.Number()])), externalRef: t.Optional(t.String()), metadata: t.Optional(t.Any()), createdAt: t.Optional(t.String()) }) })
+    }, { body: t.Object({
+      content: t.Optional(t.String()), media: t.Optional(t.Any()),
+      wallHandle: t.Optional(t.String()), wallExternalId: t.Optional(t.Union([t.String(), t.Number()])),
+      wallPageId: t.Optional(t.Union([t.String(), t.Number()])), repostOfId: t.Optional(t.Union([t.String(), t.Number()])),
+      externalRef: t.Optional(t.String()), metadata: t.Optional(t.Any()), createdAt: t.Optional(t.String()),
+      revealAt: t.Optional(t.String()), revealPlaceholder: t.Optional(t.String()),
+      countdownAt: t.Optional(t.String()), countdownLabel: t.Optional(t.String()),
+      poll: t.Optional(t.Object({ options: t.Array(t.String()), endsAt: t.Optional(t.String()) })),
+    }) })
 
     // Buscar post por su externalRef (p.ej. 'chapter:123'). Util en migraciones.
     .get('/posts/by-ref', async ({ auth, query }: any) => {
@@ -789,11 +874,13 @@ export const v1 = () =>
 
     .get('/posts/:id', async ({ auth, params, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
-      const p = await prisma.post.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, include: { author: { select: pageSel }, wall: { select: wallSel } } })
+      const p = await prisma.post.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true } })
       if (!p) return { error: 'not_found' }
       const viewer = await viewerPage(auth, request.headers)
       const [likes, saves] = await Promise.all([likedPosts(auth.appId, viewer, [p.id]), savedPosts(auth.appId, viewer, [p.id])])
-      return { data: shapePost(p, likes, saves) }
+      const uno = shapePost(p, likes, saves)
+      await attachPolls([uno], [p], viewer)
+      return { data: uno }
     })
 
     .patch('/posts/:id', async ({ auth, params, body, request }: any) => {
@@ -818,9 +905,39 @@ export const v1 = () =>
         data.wallPageId = wall.id
       }
       if (!Object.keys(data).length) return { error: 'nothing_to_update' }
-      const up = await prisma.post.update({ where: { id: post.id }, data, include: { author: { select: pageSel }, wall: { select: wallSel } } })
+      const up = await prisma.post.update({ where: { id: post.id }, data, include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true } })
       return { data: shapePost(up) }
     }, { body: t.Object({ content: t.Optional(t.String()), wallExternalId: t.Optional(t.String()) }) })
+
+    .post('/posts/:id/vote', async ({ auth, params, body, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      if (!requireScope(auth, 'react')) return { error: 'insufficient_scope' }
+      let pageId: number
+      try { pageId = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+
+      const poll = await prisma.postPoll.findUnique({ where: { postId: Number(params.id) } })
+      if (!poll || poll.appId !== auth.appId) return { error: 'not_found' }
+      if (poll.endsAt && poll.endsAt < new Date()) return { error: 'poll_closed' }
+
+      const opciones = Array.isArray(poll.options) ? poll.options : []
+      const idx = Number(body.optionIndex)
+      if (!Number.isInteger(idx) || idx < 0 || idx >= opciones.length) return { error: 'bad_option' }
+
+      const previo = await prisma.postPollVote.findUnique({ where: { pollId_pageId: { pollId: poll.id, pageId } } })
+      if (previo) {
+        if (previo.optionIndex === idx) return { error: 'already_voted' }
+        // Cambiar de opinión sí, votar dos veces no.
+        await prisma.postPollVote.update({ where: { id: previo.id }, data: { optionIndex: idx } })
+      } else {
+        await prisma.postPollVote.create({ data: { pollId: poll.id, pageId, optionIndex: idx } })
+        await prisma.postPoll.update({ where: { id: poll.id }, data: { votesCount: { increment: 1 } } })
+      }
+
+      const conteo = await prisma.postPollVote.groupBy({ by: ['optionIndex'], where: { pollId: poll.id }, _count: { optionIndex: true } })
+      const resultados = opciones.map((_: any, i: number) => conteo.find((c) => c.optionIndex === i)?._count.optionIndex ?? 0)
+      const total = resultados.reduce((a: number, b: number) => a + b, 0)
+      return { data: { results: resultados, votesCount: total, myVote: idx } }
+    }, { body: t.Object({ optionIndex: t.Number() }) })
 
     .delete('/posts/:id', async ({ auth, params, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
@@ -853,7 +970,7 @@ export const v1 = () =>
         const rows = await prisma.post.findMany({
           where: { appId: auth.appId, deletedAt: null, hiddenAt: null, OR: [{ authorPageId: { in: ids } }, { wallPageId: { in: ids } }] },
           orderBy: postOrder(asSort(query.sort)), skip: pg * limit, take: limit + 1,
-          include: { author: { select: pageSel }, wall: { select: wallSel } },
+          include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true },
         })
         has = rows.length > limit
         items = rows.slice(0, limit)
@@ -861,7 +978,7 @@ export const v1 = () =>
         const rows = await prisma.post.findMany({
           where: { appId: auth.appId, deletedAt: null, hiddenAt: null },
           orderBy: postOrder(asSort(query.sort)), skip: pg * limit, take: limit + 1,
-          include: { author: { select: pageSel }, wall: { select: wallSel } },
+          include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true },
         })
         has = rows.length > limit
         items = rows.slice(0, limit)
@@ -884,7 +1001,7 @@ export const v1 = () =>
         has = ids.length > limit
         const keep = ids.slice(0, limit)
         if (keep.length) {
-          const rows = await prisma.post.findMany({ where: { id: { in: keep } }, include: { author: { select: pageSel }, wall: { select: wallSel } } })
+          const rows = await prisma.post.findMany({ where: { id: { in: keep } }, include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true } })
           const byId = new Map(rows.map((r) => [r.id, r]))
           items = keep.map((id) => byId.get(id)).filter(Boolean) as any[]
         }
@@ -892,7 +1009,7 @@ export const v1 = () =>
         if (!items.length && pg === 0) {
           const rows = await prisma.post.findMany({
             where: { appId: auth.appId, deletedAt: null, hiddenAt: null },
-            orderBy: [{ createdAt: 'desc' }], take: limit + 1, include: { author: { select: pageSel }, wall: { select: wallSel } },
+            orderBy: [{ createdAt: 'desc' }], take: limit + 1, include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true },
           })
           has = rows.length > limit
           items = rows.slice(0, limit)
@@ -903,6 +1020,7 @@ export const v1 = () =>
       const [likes, saves] = await Promise.all([likedPosts(auth.appId, viewer, ids), savedPosts(auth.appId, viewer, ids)])
       const shaped = items.map((p) => shapePost(p, likes, saves))
 
+      await attachPolls(shaped, items, viewer)
       if (withReplies) await attachReplies(auth.appId, shaped, ids)
 
       return { data: { items: shaped, hasMore: has } }
@@ -1530,7 +1648,7 @@ export const v1 = () =>
       const hasMore = rows.length > limit
       const ids = rows.slice(0, limit).map((r) => r.postId)
       if (!ids.length) return { data: { items: [], hasMore: false } }
-      const posts = await prisma.post.findMany({ where: { id: { in: ids }, deletedAt: null }, include: { author: { select: pageSel }, wall: { select: wallSel } } })
+      const posts = await prisma.post.findMany({ where: { id: { in: ids }, deletedAt: null }, include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true } })
       posts.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id))
       const likes = await likedPosts(auth.appId, pageId, ids)
       return { data: { items: posts.map((p) => ({ ...shapePost(p, likes), saved: true })), hasMore } }
