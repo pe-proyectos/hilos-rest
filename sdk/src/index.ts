@@ -39,7 +39,7 @@ export function createHilos(opts: HilosOptions) {
       mute: (handle: string, muted = true, until?: string): Promise<{ handle: string; muted: boolean }> => req('POST', `/pages/${encodeURIComponent(handle)}/mute`, { muted, ...(until ? { until } : {}) }),
     },
     pageTokens: {
-      create: (p: { pageId?: number; externalId?: string | number; ttl?: number; scopes?: string[]; origin?: string }): Promise<{ token: string; pageId: number; expiresIn: number; scopes?: string[] }> => req('POST', '/page-tokens', p),
+      create: (p: { pageId?: number; externalId?: string | number; ttl?: number; scopes?: string[]; origin?: string; onBehalfOf?: string }): Promise<{ token: string; pageId: number; expiresIn: number; scopes?: string[] }> => req('POST', '/page-tokens', p),
     },
     posts: {
       create: (p: { content?: string; media?: any; wallHandle?: string; wallExternalId?: string | number; wallPageId?: number; repostOfId?: number; externalRef?: string; metadata?: any; createdAt?: string }, acting?: string | number): Promise<HilosPost> => req('POST', '/posts', p, acting),
@@ -60,6 +60,14 @@ export function createHilos(opts: HilosOptions) {
       list: (conversationId: number, page = 0, limit = 40, acting?: string | number) => req('GET', `/conversations/${conversationId}/messages?page=${page}&limit=${limit}`, undefined, acting),
       send: (handle: string, content: string, acting?: string | number) => req('POST', '/messages', { handle, content }, acting),
       unread: (acting?: string | number) => req('GET', '/messages/unread', undefined, acting),
+    },
+    members: {
+      list: (handle: string, acting?: string | number) => req('GET', `/pages/${encodeURIComponent(handle)}/members`, undefined, acting),
+      add: (handle: string, memberHandle: string, role: 'owner' | 'trusted' = 'trusted', acting?: string | number) =>
+        req('POST', `/pages/${encodeURIComponent(handle)}/members`, { handle: memberHandle, role }, acting),
+      remove: (handle: string, memberHandle: string, acting?: string | number) =>
+        req('DELETE', `/pages/${encodeURIComponent(handle)}/members/${encodeURIComponent(memberHandle)}`, undefined, acting),
+      mine: (acting?: string | number) => req('GET', '/me/pages', undefined, acting),
     },
     notifications: {
       list: (page = 0, limit = 20, acting?: string | number) => req('GET', `/notifications?page=${page}&limit=${limit}`, undefined, acting),

@@ -30,9 +30,15 @@ function parseHashtags(c: string): string[] {
   }
   return [...out].slice(0, 12)
 }
-const pageSel = { id: true, handle: true, type: true, parentPageId: true, externalId: true, displayName: true, avatarUrl: true, bannerUrl: true, bio: true, followersCount: true, followingCount: true, postsCount: true, createdAt: true }
-function shapePage(p: any) { return p ? { ...p } : null }
-const wallSel = { id: true, handle: true, type: true, displayName: true, avatarUrl: true, parentPageId: true }
+const pageSel = { id: true, handle: true, type: true, parentPageId: true, parent: { select: { handle: true, displayName: true } }, externalId: true, displayName: true, avatarUrl: true, bannerUrl: true, bio: true, followersCount: true, followingCount: true, postsCount: true, createdAt: true }
+function shapePage(p: any) {
+  if (!p) return null
+  const { parent, ...resto } = p
+  // Las subpages (una obra dentro de un scan) viven bajo la ruta de su padre:
+  // quien las pinta necesita el handle, no solo el id.
+  return { ...resto, parentHandle: parent?.handle ?? null, parentDisplayName: parent?.displayName ?? null }
+}
+const wallSel = { id: true, handle: true, type: true, displayName: true, avatarUrl: true, parentPageId: true, parent: { select: { handle: true, displayName: true } } }
 function shapePost(p: any, likedSet?: Set<number>, savedSet?: Set<number>) {
   return {
     id: p.id, content: p.content, media: p.media ?? null, repostOfId: p.repostOfId ?? null, externalRef: p.externalRef ?? null,
@@ -89,6 +95,15 @@ async function notifyMentions(appId: number, content: string, actorPageId: numbe
   if (!handles.length) return
   const pages = await prisma.page.findMany({ where: { appId, handle: { in: handles } }, select: { id: true } }).catch(() => [])
   for (const p of pages) notify(appId, p.id, actorPageId, 'mention', { ...extra, preview: content })
+}
+
+// Papel de una page dentro de otra (equipo de un scan). null = no pertenece.
+async function memberRole(appId: number, pageId: number, memberPageId: number): Promise<string | null> {
+  const m = await prisma.pageMember.findUnique({
+    where: { pageId_memberPageId: { pageId, memberPageId } },
+    select: { role: true, appId: true },
+  }).catch(() => null)
+  return m && m.appId === appId ? m.role : null
 }
 
 // ¿Esta page está silenciada por el staff? (metadata.mutedUntil)
@@ -473,6 +488,20 @@ export const v1 = () =>
       if (body.pageId) { const p = await prisma.page.findFirst({ where: { id: Number(body.pageId), appId: auth.appId }, select: { id: true } }); pageId = p?.id ?? null }
       else if (body.externalId) { const p = await prisma.page.findUnique({ where: { appId_externalId: { appId: auth.appId, externalId: String(body.externalId) } }, select: { id: true } }); pageId = p?.id ?? null }
       if (!pageId) return { error: 'page_not_found' }
+
+      // Actuar en nombre de otra page (un scan): el motor comprueba que quien
+      // lo pide pertenece a ese equipo, para que la app no pueda equivocarse.
+      if (body.onBehalfOf) {
+        const destino = await prisma.page.findUnique({
+          where: { appId_handle: { appId: auth.appId, handle: String(body.onBehalfOf).toLowerCase() } },
+          select: { id: true },
+        })
+        if (!destino) return { error: 'page_not_found' }
+        const rol = await memberRole(auth.appId, destino.id, pageId)
+        if (!rol) return { error: 'not_a_member' }
+        pageId = destino.id
+      }
+
       // TTL corto por defecto (15 min): el cliente renueva desde su backend.
       const ttl = Math.min(3600, Math.max(60, Number(body.ttl) || 900))
       const scopes = Array.isArray(body.scopes) && body.scopes.length
@@ -481,7 +510,7 @@ export const v1 = () =>
       const aud = body.origin ? String(body.origin) : undefined
       const token = signJwt({ t: 'page', appId: auth.appId, pageId, sub: `page:${pageId}`, scope: scopes.join(' '), ...(aud ? { aud } : {}) }, SECRET, ttl)
       return { data: { token, pageId, expiresIn: ttl, scopes } }
-    }, { body: t.Object({ pageId: t.Optional(t.Union([t.String(), t.Number()])), externalId: t.Optional(t.Union([t.String(), t.Number()])), ttl: t.Optional(t.Number()), scopes: t.Optional(t.Array(t.String())), origin: t.Optional(t.String()) }) })
+    }, { body: t.Object({ pageId: t.Optional(t.Union([t.String(), t.Number()])), externalId: t.Optional(t.Union([t.String(), t.Number()])), ttl: t.Optional(t.Number()), scopes: t.Optional(t.Array(t.String())), origin: t.Optional(t.String()), onBehalfOf: t.Optional(t.String()) }) })
 
     .post('/page-tokens/revoke', async ({ auth, body }: any) => {
       if (!auth) return { error: 'unauthorized' }
@@ -915,6 +944,94 @@ export const v1 = () =>
       const r = await prisma.notification.updateMany({ where, data: { readAt: new Date() } })
       return { data: { updated: r.count } }
     }, { body: t.Optional(t.Object({ id: t.Optional(t.Union([t.String(), t.Number()])) })) })
+
+    // ---- Equipo de una page ----
+    // Quién puede publicar en nombre de un scan y quién administra ese equipo.
+    .get('/pages/:handle/members', async ({ auth, params, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const page = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: String(params.handle).toLowerCase() } }, select: { id: true } })
+      if (!page) return { error: 'not_found' }
+
+      // La lista del equipo solo la ve el propio equipo (o el backend).
+      if (auth.mode !== 'secret') {
+        const me = await viewerPage(auth, request.headers)
+        if (!me || !(await memberRole(auth.appId, page.id, me))) return { error: 'forbidden' }
+      }
+
+      const rows = await prisma.pageMember.findMany({
+        where: { appId: auth.appId, pageId: page.id },
+        orderBy: [{ role: 'asc' }, { createdAt: 'asc' }],
+        include: { member: { select: pageSel } },
+      })
+      return { data: rows.map((r) => ({ role: r.role, since: r.createdAt, page: shapePage(r.member) })) }
+    })
+
+    // Las pages que puedo manejar: alimenta el selector de identidad.
+    .get('/me/pages', async ({ auth, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      let me: number
+      try { me = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+      const rows = await prisma.pageMember.findMany({
+        where: { appId: auth.appId, memberPageId: me },
+        orderBy: { createdAt: 'asc' },
+        include: { page: { select: pageSel } },
+      })
+      return { data: rows.map((r) => ({ role: r.role, page: shapePage(r.page) })) }
+    })
+
+    .post('/pages/:handle/members', async ({ auth, params, body, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const page = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: String(params.handle).toLowerCase() } }, select: { id: true } })
+      if (!page) return { error: 'not_found' }
+
+      // Solo un owner reparte papeles. Con secret key manda la app (semillas).
+      if (auth.mode !== 'secret') {
+        const me = await viewerPage(auth, request.headers)
+        if (!me || (await memberRole(auth.appId, page.id, me)) !== 'owner') return { error: 'forbidden' }
+      }
+
+      const target = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: String(body.handle).toLowerCase() } }, select: { id: true, type: true } })
+      if (!target) return { error: 'page_not_found' }
+      if (target.id === page.id) return { error: 'cannot_add_self' }
+
+      const role = body.role === 'owner' ? 'owner' : 'trusted'
+      const m = await prisma.pageMember.upsert({
+        where: { pageId_memberPageId: { pageId: page.id, memberPageId: target.id } },
+        create: { appId: auth.appId, pageId: page.id, memberPageId: target.id, role },
+        update: { role },
+        include: { member: { select: pageSel } },
+      })
+      return { data: { role: m.role, page: shapePage(m.member) } }
+    }, { body: t.Object({ handle: t.String(), role: t.Optional(t.String()) }) })
+
+    .delete('/pages/:handle/members/:memberHandle', async ({ auth, params, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const page = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: String(params.handle).toLowerCase() } }, select: { id: true } })
+      if (!page) return { error: 'not_found' }
+
+      const target = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: String(params.memberHandle).toLowerCase() } }, select: { id: true } })
+      if (!target) return { error: 'page_not_found' }
+
+      let me: number | null = null
+      if (auth.mode !== 'secret') {
+        me = await viewerPage(auth, request.headers)
+        const miRol = me ? await memberRole(auth.appId, page.id, me) : null
+        // Un owner echa a quien quiera; cualquiera puede irse por su cuenta.
+        if (miRol !== 'owner' && me !== target.id) return { error: 'forbidden' }
+      }
+
+      const actual = await prisma.pageMember.findUnique({ where: { pageId_memberPageId: { pageId: page.id, memberPageId: target.id } }, select: { role: true } })
+      if (!actual) return { error: 'not_found' }
+
+      // Nunca dejamos una page sin responsable.
+      if (actual.role === 'owner') {
+        const owners = await prisma.pageMember.count({ where: { pageId: page.id, role: 'owner' } })
+        if (owners <= 1) return { error: 'last_owner' }
+      }
+
+      await prisma.pageMember.delete({ where: { pageId_memberPageId: { pageId: page.id, memberPageId: target.id } } })
+      return { data: { ok: true } }
+    })
 
     // ---- Mensajeria directa ----
     // Reglas: puedes ESCRIBIR a alguien solo si tu lo sigues. Y solo puedes

@@ -80,6 +80,8 @@ model Page {
   wallPosts     Post[]    @relation("PostWall")
   comments      Comment[]
   memberships   ConversationMember[]
+  members       PageMember[] @relation("PageMembers")
+  managesPages  PageMember[] @relation("PageManager")
   sentMessages  Message[]
   notifications Notification[] @relation("NotifTarget")
   actedNotifs   Notification[] @relation("NotifActor")
@@ -282,4 +284,23 @@ model Notification {
   @@index([appId, pageId, createdAt])
   @@index([appId, pageId, readAt])
   @@map("notification")
+}
+
+// Quién puede actuar en nombre de una page (p. ej. el equipo de un scan).
+//   owner   -> manda: publica y además decide quién entra y con qué papel
+//   trusted -> publica y responde en nombre de la page, pero no toca el equipo
+// Una page siempre debe conservar al menos un owner.
+model PageMember {
+  id           Int      @id @default(autoincrement())
+  appId        Int
+  pageId       Int      // la page gestionada (el scan)
+  memberPageId Int      // la page de la persona
+  role         String   @default("trusted") @db.VarChar(16)
+  createdAt    DateTime @default(now()) @db.Timestamp(6)
+  page         Page     @relation("PageMembers", fields: [pageId], references: [id], onDelete: Cascade)
+  member       Page     @relation("PageManager", fields: [memberPageId], references: [id], onDelete: Cascade)
+
+  @@unique([pageId, memberPageId])
+  @@index([appId, memberPageId])
+  @@map("page_member")
 }
