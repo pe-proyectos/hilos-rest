@@ -472,13 +472,19 @@ export const v1 = () =>
       if (!auth) return { error: 'unauthorized' }
       const page = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: params.handle } }, select: pageSel })
       if (!page) return { error: 'not_found' }
+      // Para una obra, el número que la describe es el de su muro.
+      let postsCount = page.postsCount
+      if (page.type === 'manga') {
+        postsCount = await prisma.post.count({ where: { appId: auth.appId, wallPageId: page.id, deletedAt: null, hiddenAt: null } })
+      }
+
       let viewerFollows = false
       const viewerPageId = auth.pageId ?? (await actingPage(auth, request.headers).catch(() => null))
       if (viewerPageId && viewerPageId !== page.id) {
         const f = await prisma.follow.findUnique({ where: { appId_followerPageId_followedPageId: { appId: auth.appId, followerPageId: viewerPageId, followedPageId: page.id } }, select: { id: true } })
         viewerFollows = !!f
       }
-      return { data: { ...shapePage(page), viewerFollows } }
+      return { data: { ...shapePage(page), postsCount, viewerFollows } }
     })
 
     // Mintea un page token (JWT app+page) desde el server del consumidor.
@@ -1116,8 +1122,27 @@ export const v1 = () =>
         skip: pg * limit, take: limit + 1, select: pageSel,
       })
       const hasMore = rows.length > limit
+      const visibles = rows.slice(0, limit)
       const total = await prisma.page.count({ where: { appId: auth.appId, parentPageId: parent.id } })
-      return { data: { items: rows.slice(0, limit).map(shapePage), hasMore, total } }
+
+      // Cuántas publicaciones hay en el muro de cada obra.
+      const ids = visibles.map((p) => p.id)
+      const enMuro = ids.length
+        ? await prisma.post.groupBy({
+            by: ['wallPageId'],
+            where: { appId: auth.appId, deletedAt: null, hiddenAt: null, wallPageId: { in: ids } },
+            _count: { wallPageId: true },
+          })
+        : []
+      const porMuro = new Map(enMuro.map((r) => [r.wallPageId, r._count.wallPageId]))
+
+      return {
+        data: {
+          items: visibles.map((p) => ({ ...shapePage(p), postsCount: porMuro.get(p.id) ?? p.postsCount })),
+          hasMore,
+          total,
+        },
+      }
     })
 
     // Mensajes de una conversacion (mas recientes primero para paginar hacia atras).
