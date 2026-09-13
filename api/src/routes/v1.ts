@@ -1457,11 +1457,22 @@ export const v1 = () =>
 
       return { data: { id: c.id, content: c.content, parentCommentId: c.parentCommentId, likesCount: 0, createdAt: c.createdAt, author: shapePage(c.author) } }
     }, { body: t.Object({ content: t.String(), parentCommentId: t.Optional(t.Union([t.String(), t.Number()])), parentExternalRef: t.Optional(t.String()), externalRef: t.Optional(t.String()), createdAt: t.Optional(t.String()) }) })
-    .delete('/comments/:id', async ({ auth, params }: any) => {
+    .delete('/comments/:id', async ({ auth, params, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
-      const c = await prisma.comment.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, select: { id: true, postId: true, authorPageId: true } })
+      const c = await prisma.comment.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, select: { id: true, postId: true, authorPageId: true, createdAt: true } })
       if (!c) return { error: 'not_found' }
-      if (!(auth.mode === 'secret' || (auth.mode === 'page' && auth.pageId === c.authorPageId))) return { error: 'forbidden' }
+
+      // El backend de la app (secret key) modera sin límite de tiempo.
+      if (auth.mode !== 'secret') {
+        const yo = await viewerPage(auth, request.headers)
+        if (!yo || yo !== c.authorPageId) return { error: 'forbidden' }
+        // El autor puede retirar lo suyo durante 24 horas. Pasado ese plazo,
+        // la conversación ya es de todos: se pide a un moderador.
+        const horas = (Date.now() - new Date(c.createdAt).getTime()) / 3_600_000
+        if (horas > 24) return { error: 'too_old' }
+      }
+
+      // Borrado lógico: el contenido se conserva para poder moderarlo después.
       await prisma.comment.update({ where: { id: c.id }, data: { deletedAt: new Date() } })
       await prisma.post.update({ where: { id: c.postId }, data: { commentsCount: { decrement: 1 } } }).catch(() => {})
       return { data: { ok: true } }
