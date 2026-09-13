@@ -60,6 +60,8 @@ export function createHilos(opts: HilosOptions) {
       list: (conversationId: number, page = 0, limit = 40, acting?: string | number) => req('GET', `/conversations/${conversationId}/messages?page=${page}&limit=${limit}`, undefined, acting),
       send: (handle: string, content: string, acting?: string | number) => req('POST', '/messages', { handle, content }, acting),
       unread: (acting?: string | number) => req('GET', '/messages/unread', undefined, acting),
+      archive: (conversationId: number, archived = true, acting?: string | number) =>
+        req('POST', `/conversations/${conversationId}/archive`, { archived }, acting),
     },
     members: {
       list: (handle: string, acting?: string | number) => req('GET', `/pages/${encodeURIComponent(handle)}/members`, undefined, acting),
@@ -68,6 +70,8 @@ export function createHilos(opts: HilosOptions) {
       remove: (handle: string, memberHandle: string, acting?: string | number) =>
         req('DELETE', `/pages/${encodeURIComponent(handle)}/members/${encodeURIComponent(memberHandle)}`, undefined, acting),
       mine: (acting?: string | number) => req('GET', '/me/pages', undefined, acting),
+      subpages: (handle: string, page = 0, limit = 30, q?: string) =>
+        req('GET', `/pages/${encodeURIComponent(handle)}/subpages?page=${page}&limit=${limit}${q ? `&q=${encodeURIComponent(q)}` : ''}`),
     },
     notifications: {
       list: (page = 0, limit = 20, acting?: string | number) => req('GET', `/notifications?page=${page}&limit=${limit}`, undefined, acting),

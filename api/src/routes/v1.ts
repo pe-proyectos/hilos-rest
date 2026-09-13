@@ -1045,8 +1045,9 @@ export const v1 = () =>
       const limit = Math.min(50, Number(query.limit) || 20)
       const pg = Math.max(0, Number(query.page) || 0)
 
+      const archivadas = query.archived === '1' || query.archived === 'true'
       const rows = await prisma.conversationMember.findMany({
-        where: { pageId: me, archivedAt: null },
+        where: { pageId: me, ...(archivadas ? { archivedAt: { not: null } } : { archivedAt: null }) },
         orderBy: { conversation: { lastMessageAt: 'desc' } },
         skip: pg * limit, take: limit + 1,
         include: { conversation: { include: { members: { include: { page: { select: pageSel } } } } } },
@@ -1075,6 +1076,7 @@ export const v1 = () =>
         out.push({
           id: r.conversationId,
           page: shapePage(other.page),
+          archived: !!r.archivedAt,
           canRead,
           lastMessage: last ? { content: last.content.slice(0, 140), createdAt: last.createdAt, mine: last.senderPageId === me } : null,
           lastMessageAt: r.conversation.lastMessageAt,
@@ -1082,6 +1084,40 @@ export const v1 = () =>
         })
       }
       return { data: { items: out, hasMore } }
+    })
+
+    // Archivar o recuperar una conversación (por persona, no para todos).
+    .post('/conversations/:id/archive', async ({ auth, params, body, request }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      let me: number
+      try { me = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+      const conversationId = Number(params.id)
+      const member = await prisma.conversationMember.findUnique({ where: { conversationId_pageId: { conversationId, pageId: me } }, select: { id: true } })
+      if (!member) return { error: 'not_found' }
+      const archivar = body?.archived === false ? false : true
+      await prisma.conversationMember.update({ where: { id: member.id }, data: { archivedAt: archivar ? new Date() : null } })
+      return { data: { id: conversationId, archived: archivar } }
+    }, { body: t.Optional(t.Object({ archived: t.Optional(t.Boolean()) })) })
+
+    // Subpages de una page: las obras de un scan.
+    .get('/pages/:handle/subpages', async ({ auth, params, query }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const parent = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: String(params.handle).toLowerCase() } }, select: { id: true } })
+      if (!parent) return { error: 'not_found' }
+      const limit = Math.min(60, Math.max(1, Number(query.limit) || 30))
+      const pg = Math.max(0, Number(query.page) || 0)
+      const where: any = { appId: auth.appId, parentPageId: parent.id }
+      if (query.q) where.OR = [
+        { handle: { contains: String(query.q), mode: 'insensitive' } },
+        { displayName: { contains: String(query.q), mode: 'insensitive' } },
+      ]
+      const rows = await prisma.page.findMany({
+        where, orderBy: [{ postsCount: 'desc' }, { id: 'asc' }],
+        skip: pg * limit, take: limit + 1, select: pageSel,
+      })
+      const hasMore = rows.length > limit
+      const total = await prisma.page.count({ where: { appId: auth.appId, parentPageId: parent.id } })
+      return { data: { items: rows.slice(0, limit).map(shapePage), hasMore, total } }
     })
 
     // Mensajes de una conversacion (mas recientes primero para paginar hacia atras).
