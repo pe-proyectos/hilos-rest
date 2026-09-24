@@ -606,6 +606,27 @@ export const v1 = () =>
       return { data: src.slice(0, limit).map((r: any) => ({ tag: r.tag, count: r._count.tag })) }
     })
 
+    // Muros (pages) con mas comentarios en los ultimos N dias. Lo usa el app
+    // consumidor para ordenar lo mas comentado (ej. obras en su portada).
+    .get('/socials/most-commented', async ({ auth, query }: any) => {
+      if (!auth) return { error: 'unauthorized' }
+      const limit = Math.min(200, Number(query.limit) || 20)
+      const days = Math.min(90, Math.max(1, Number(query.days) || 7))
+      const rows = await prisma.$queryRaw<{ externalId: string | null; n: bigint }[]>`
+        SELECT w."externalId", COUNT(*) AS n
+        FROM comment c
+        JOIN post p ON p.id = c."postId"
+        JOIN page w ON w.id = p."wallPageId"
+        WHERE c."appId" = ${auth.appId}
+          AND c."deletedAt" IS NULL AND c."hiddenAt" IS NULL
+          AND c."createdAt" > NOW() - (${days} || ' days')::interval
+          AND w."externalId" IS NOT NULL
+        GROUP BY w."externalId"
+        ORDER BY n DESC
+        LIMIT ${limit}`
+      return { data: rows.map((r) => ({ externalId: r.externalId, count: Number(r.n) })) }
+    })
+
     // Pages con mas movimiento (posts recientes). Es lo que de verdad esta
     // pasando en la red cuando todavia no hay hashtags con traccion.
     .get('/socials/active', async ({ auth, query }: any) => {
