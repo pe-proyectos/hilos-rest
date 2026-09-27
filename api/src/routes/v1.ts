@@ -606,6 +606,53 @@ export const v1 = () =>
       return { data: src.slice(0, limit).map((r: any) => ({ tag: r.tag, count: r._count.tag })) }
     })
 
+    // Rankings agregados de comentarios para el app consumidor (solo clave
+    // secreta). Devuelve [{ externalId, count }] ordenado de mayor a menor.
+    //   comments          comentarios escritos por cada page de usuario
+    //   replies           respuestas escritas (comentarios que responden a otro)
+    //   replies_received  respuestas que recibieron sus comentarios (sin contar
+    //                     las que se hace uno mismo)
+    //   scan_comments     comentarios en los muros de un scan o de sus obras
+    .get('/socials/leaderboard', async ({ auth, query }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      const limit = Math.min(500, Math.max(1, Number(query.limit) || 100))
+      const metric = String(query.metric || '')
+      let rows: { externalId: string | null; n: bigint }[] = []
+      if (metric === 'comments' || metric === 'replies') {
+        const soloRespuestas = metric === 'replies'
+        rows = await prisma.$queryRaw`
+          SELECT a."externalId", COUNT(*) AS n
+          FROM comment c JOIN page a ON a.id = c."authorPageId"
+          WHERE c."appId" = ${auth.appId} AND c."deletedAt" IS NULL AND c."hiddenAt" IS NULL
+            AND a.type = 'user' AND a."externalId" IS NOT NULL
+            AND (${soloRespuestas} = false OR c."parentCommentId" IS NOT NULL)
+          GROUP BY a."externalId" ORDER BY n DESC LIMIT ${limit}`
+      } else if (metric === 'replies_received') {
+        rows = await prisma.$queryRaw`
+          SELECT a."externalId", COUNT(*) AS n
+          FROM comment c
+          JOIN comment p ON p.id = c."parentCommentId"
+          JOIN page a ON a.id = p."authorPageId"
+          WHERE c."appId" = ${auth.appId} AND c."deletedAt" IS NULL AND c."hiddenAt" IS NULL
+            AND c."authorPageId" <> p."authorPageId"
+            AND a.type = 'user' AND a."externalId" IS NOT NULL
+          GROUP BY a."externalId" ORDER BY n DESC LIMIT ${limit}`
+      } else if (metric === 'scan_comments') {
+        rows = await prisma.$queryRaw`
+          SELECT CASE WHEN w.type = 'scan' THEN w."externalId" ELSE s."externalId" END AS "externalId", COUNT(*) AS n
+          FROM comment c
+          JOIN post po ON po.id = c."postId"
+          JOIN page w ON w.id = po."wallPageId"
+          LEFT JOIN page s ON s.id = w."parentPageId"
+          WHERE c."appId" = ${auth.appId} AND c."deletedAt" IS NULL AND c."hiddenAt" IS NULL
+            AND (w.type = 'scan' OR s.type = 'scan')
+          GROUP BY 1 ORDER BY n DESC LIMIT ${limit}`
+      } else {
+        return { error: 'unknown_metric' }
+      }
+      return { data: rows.filter((r) => r.externalId).map((r) => ({ externalId: r.externalId, count: Number(r.n) })) }
+    })
+
     // Muros (pages) con mas comentarios en los ultimos N dias. Lo usa el app
     // consumidor para ordenar lo mas comentado (ej. obras en su portada).
     .get('/socials/most-commented', async ({ auth, query }: any) => {
