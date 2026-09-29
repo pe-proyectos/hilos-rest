@@ -135,6 +135,48 @@ async function isMuted(pageId: number): Promise<boolean> {
   return new Date(until) > new Date()
 }
 
+// ── Moderación por alcance ───────────────────────────────────────────────────
+// Un "alcance" es una page raíz (el scan de una app) y todas sus subpages (sus
+// obras). La app modera SIEMPRE dentro de un alcance: el staff de un scan solo
+// toca comentarios de su scan y solo silencia a alguien en su scan.
+
+type Alcance = { roots: Array<{ id: number; handle: string; displayName: string | null }>; ids: Set<number> }
+
+async function resolverAlcance(appId: number, refs: string): Promise<Alcance | null> {
+  const lista = String(refs || '').split(',').map((r) => r.trim()).filter(Boolean).slice(0, 20)
+  if (!lista.length) return null
+  const roots: Alcance['roots'] = []
+  for (const ref of lista) {
+    const sel = { id: true, handle: true, displayName: true }
+    const p = ref.startsWith('external:')
+      ? await prisma.page.findUnique({ where: { appId_externalId: { appId, externalId: ref.slice(9) } }, select: sel })
+      : await prisma.page.findUnique({ where: { appId_handle: { appId, handle: ref.toLowerCase() } }, select: sel })
+    if (p) roots.push(p)
+  }
+  if (!roots.length) return null
+  const hijos = await prisma.page.findMany({ where: { appId, parentPageId: { in: roots.map((r) => r.id) } }, select: { id: true } })
+  return { roots, ids: new Set([...roots.map((r) => r.id), ...hijos.map((h) => h.id)]) }
+}
+
+const enAlcance = (a: Alcance, post: { wallPageId: number | null; authorPageId: number | null } | null) =>
+  !!post && ((post.wallPageId != null && a.ids.has(post.wallPageId)) || (post.authorPageId != null && a.ids.has(post.authorPageId)))
+
+// Silencios por alcance: metadata.mutes de la page raíz, por id de la page
+// silenciada: { until: ISO | 'forever', reason, at, by }.
+type Silencio = { until: string; reason?: string | null; at: string; by?: string | null }
+const silencioVigente = (m?: Silencio | null) => !!m && (m.until === 'forever' || new Date(m.until) > new Date())
+
+/** ¿Está silenciada esta page para escribir en ese muro (o en su scan)? */
+async function silencioEnMuro(appId: number, authorPageId: number, wallPageId: number): Promise<{ until: string; scope: string | null } | null> {
+  const wall = await prisma.page.findFirst({ where: { id: wallPageId, appId }, select: { id: true, displayName: true, metadata: true, parent: { select: { id: true, displayName: true, metadata: true } } } })
+  if (!wall) return null
+  for (const p of [wall, wall.parent].filter(Boolean) as any[]) {
+    const m = (p.metadata as any)?.mutes?.[String(authorPageId)] as Silencio | undefined
+    if (silencioVigente(m)) return { until: m!.until, scope: p.displayName ?? null }
+  }
+  return null
+}
+
 // Ordenaciones disponibles en las listas. 'reciente' es el valor por defecto
 // en casi todo: lo último es lo que la gente viene a ver.
 type SortKey = 'reciente' | 'antiguo' | 'popular' | 'comentado' | 'menos_popular' | 'menos_comentado'
@@ -876,6 +918,11 @@ export const v1 = () =>
         if (!w) return { error: 'wall_not_found' }
         wallPageId = w.id
       }
+      // Publicar en el muro de un scan (o de sus obras) donde te silenciaron.
+      if (auth.mode === 'page' && wallPageId !== authorPageId) {
+        const sil = await silencioEnMuro(auth.appId, authorPageId, wallPageId)
+        if (sil) return { error: 'muted_scope', until: sil.until, scope: sil.scope }
+      }
       // Dedupe por externalRef (auto-post/migracion idempotente).
       if (body.externalRef) {
         const dup = await prisma.post.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef: String(body.externalRef) } }, include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true } }).catch(() => null)
@@ -1467,8 +1514,13 @@ export const v1 = () =>
       try { authorPageId = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
       if (auth.mode === 'page' && !rateLimit(`comment:${authorPageId}`, 30, 5 * 60_000)) return { error: 'rate_limited' }
       if (auth.mode === 'page' && await isMuted(authorPageId)) return { error: 'muted' }
-      const post = await prisma.post.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, select: { id: true } })
+      const post = await prisma.post.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, select: { id: true, wallPageId: true } })
       if (!post) return { error: 'post_not_found' }
+      // Silenciado por el scan dueño de ese muro (solo ahí, no en toda la app).
+      if (auth.mode === 'page' && post.wallPageId) {
+        const sil = await silencioEnMuro(auth.appId, authorPageId, post.wallPageId)
+        if (sil) return { error: 'muted_scope', until: sil.until, scope: sil.scope }
+      }
       const content = String(body.content || '').trim().slice(0, MAX_CONTENT)
       if (!content) return { error: 'empty_comment' }
       // Dedupe por externalRef (migraciones idempotentes).
@@ -1626,48 +1678,169 @@ export const v1 = () =>
       return { data: { handle: String(params.handle).toLowerCase(), muted, until: meta.mutedUntil ?? null } }
     }, { body: t.Optional(t.Object({ muted: t.Optional(t.Boolean()), until: t.Optional(t.String()) })) })
 
+    // ---- Moderación por alcance (solo secret key: la app valida al staff) ----
+
+    // ¿Este comentario o post es del alcance? Devuelve el detalle para que la
+    // app decida y avise al autor. Sin alcance válido responde not_found.
+    .get('/moderation/check', async ({ auth, query }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      const a = await resolverAlcance(auth.appId, query.scope)
+      if (!a) return { error: 'scope_not_found' }
+      if (query.comment) {
+        const c = await prisma.comment.findFirst({
+          where: { id: Number(query.comment), appId: auth.appId },
+          select: { id: true, content: true, hiddenAt: true, deletedAt: true, createdAt: true, parentCommentId: true, author: { select: pageSel }, post: { select: { id: true, content: true, externalRef: true, wallPageId: true, authorPageId: true, wall: { select: wallSel } } } },
+        })
+        if (!c || !enAlcance(a, c.post)) return { error: 'not_found' }
+        return { data: { type: 'comment', id: c.id, content: c.content, hidden: !!c.hiddenAt, deleted: !!c.deletedAt, createdAt: c.createdAt, parentCommentId: c.parentCommentId, author: shapePage(c.author), post: { id: c.post.id, title: c.post.content?.slice(0, 90) || '', externalRef: c.post.externalRef, wall: c.post.wall } } }
+      }
+      if (query.post) {
+        const p = await prisma.post.findFirst({ where: { id: Number(query.post), appId: auth.appId, deletedAt: null }, select: { id: true, content: true, externalRef: true, wallPageId: true, authorPageId: true } })
+        if (!p || !enAlcance(a, p)) return { error: 'not_found' }
+        return { data: { type: 'post', id: p.id, title: p.content?.slice(0, 90) || '', externalRef: p.externalRef } }
+      }
+      return { error: 'bad_request' }
+    })
+
+    // Silenciar a alguien SOLO en un alcance (scan y sus obras). Opcionalmente
+    // borra (lógico) sus comentarios en ese alcance: todos o las últimas 24 h.
+    .post('/moderation/mutes', async ({ auth, body }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      const a = await resolverAlcance(auth.appId, String(body?.scope || '').split(',')[0])
+      if (!a) return { error: 'scope_not_found' }
+      const root = a.roots[0]
+      const ref = String(body?.target || '')
+      const target = ref.startsWith('external:')
+        ? await prisma.page.findUnique({ where: { appId_externalId: { appId: auth.appId, externalId: ref.slice(9) } }, select: pageSel })
+        : await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: ref.toLowerCase() } }, select: pageSel })
+      if (!target) return { error: 'target_not_found' }
+      if (a.ids.has(target.id)) return { error: 'cannot_mute_scope' }
+      const until = body?.until ? new Date(body.until) : null
+      if (until && (isNaN(until.getTime()) || until <= new Date())) return { error: 'bad_until' }
+      const silencio: Silencio = { until: until ? until.toISOString() : 'forever', reason: body?.reason ? String(body.reason).slice(0, 300) : null, at: new Date().toISOString(), by: body?.by ? String(body.by).slice(0, 80) : null }
+      // Atómico: no pisa otros silencios del mismo scan escritos a la vez.
+      await prisma.$executeRaw`
+        UPDATE "page" SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{mutes}', COALESCE(metadata->'mutes', '{}'::jsonb) || jsonb_build_object(${String(target.id)}::text, ${JSON.stringify(silencio)}::jsonb))
+        WHERE id = ${root.id}`
+      let borrados = 0
+      const modo = String(body?.deleteComments || 'none')
+      if (modo === 'all' || modo === '24h') {
+        const where: any = { appId: auth.appId, authorPageId: target.id, deletedAt: null, post: { OR: [{ wallPageId: { in: [...a.ids] } }, { authorPageId: { in: [...a.ids] } }] } }
+        if (modo === '24h') where.createdAt = { gte: new Date(Date.now() - 86_400_000) }
+        const lista = await prisma.comment.findMany({ where, select: { id: true, postId: true } })
+        if (lista.length) {
+          await prisma.comment.updateMany({ where: { id: { in: lista.map((c) => c.id) } }, data: { deletedAt: new Date() } })
+          const porPost = new Map<number, number>()
+          for (const c of lista) porPost.set(c.postId, (porPost.get(c.postId) || 0) + 1)
+          for (const [postId, n] of porPost) await prisma.post.update({ where: { id: postId }, data: { commentsCount: { decrement: n } } }).catch(() => {})
+          borrados = lista.length
+        }
+      }
+      return { data: { scope: root, target: shapePage(target), ...silencio, deletedComments: borrados } }
+    })
+
+    // Quitar el silencio de alguien en un alcance.
+    .delete('/moderation/mutes', async ({ auth, query }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      const a = await resolverAlcance(auth.appId, String(query.scope || '').split(',')[0])
+      if (!a) return { error: 'scope_not_found' }
+      const ref = String(query.target || '')
+      const target = ref.startsWith('external:')
+        ? await prisma.page.findUnique({ where: { appId_externalId: { appId: auth.appId, externalId: ref.slice(9) } }, select: { id: true } })
+        : /^\d+$/.test(ref) ? { id: Number(ref) } : await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: ref.toLowerCase() } }, select: { id: true } })
+      if (!target) return { error: 'target_not_found' }
+      await prisma.$executeRaw`UPDATE "page" SET metadata = metadata #- ARRAY['mutes', ${String(target.id)}::text] WHERE id = ${a.roots[0].id}`
+      return { data: { ok: true } }
+    })
+
+    // Silencios: de un alcance (panel del scan) o de una persona (sus sanciones).
+    .get('/moderation/mutes', async ({ auth, query }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      const soloVigentes = query.active === '1' || query.active === 'true'
+      if (query.scope) {
+        const a = await resolverAlcance(auth.appId, String(query.scope).split(',')[0])
+        if (!a) return { error: 'scope_not_found' }
+        const root = await prisma.page.findUnique({ where: { id: a.roots[0].id }, select: { metadata: true } })
+        const mutes = ((root?.metadata as any)?.mutes || {}) as Record<string, Silencio>
+        const ids = Object.keys(mutes).map(Number).filter(Boolean)
+        const pages = ids.length ? await prisma.page.findMany({ where: { id: { in: ids }, appId: auth.appId }, select: pageSel }) : []
+        const items = pages
+          .map((p) => ({ target: shapePage(p), ...mutes[String(p.id)], active: silencioVigente(mutes[String(p.id)]) }))
+          .filter((m) => !soloVigentes || m.active)
+          .sort((x, y) => String(y.at).localeCompare(String(x.at)))
+        return { data: { scope: a.roots[0], items } }
+      }
+      if (query.target) {
+        const ref = String(query.target)
+        const target = ref.startsWith('external:')
+          ? await prisma.page.findUnique({ where: { appId_externalId: { appId: auth.appId, externalId: ref.slice(9) } }, select: { id: true } })
+          : await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: ref.toLowerCase() } }, select: { id: true } })
+        if (!target) return { data: { items: [] } }
+        const key = String(target.id)
+        const rows = await prisma.$queryRaw<Array<{ id: number; handle: string; displayName: string | null; avatarUrl: string | null; externalId: string | null; mute: any }>>`
+          SELECT id, handle, "displayName", "avatarUrl", "externalId", metadata->'mutes'->${key} AS mute
+          FROM "page" WHERE "appId" = ${auth.appId} AND metadata->'mutes' ? ${key}`
+        const items = rows
+          .map((r) => ({ scope: { id: r.id, handle: r.handle, displayName: r.displayName, avatarUrl: r.avatarUrl, externalId: r.externalId }, ...(r.mute as Silencio), active: silencioVigente(r.mute) }))
+          .filter((m) => !soloVigentes || m.active)
+        return { data: { items } }
+      }
+      return { error: 'bad_request' }
+    })
+
     // Moderación: comentarios de todo lo que cuelga de una page (un scan y sus
     // obras). Solo con secret key: la app es quien sabe si quien pregunta es
     // staff de ese scan.
     .get('/moderation/comments', async ({ auth, query }: any) => {
       if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
-      // Se admite handle o 'external:<id>': el externalId es estable aunque la
-      // app renombre la page.
-      const ref = String(query.page || '').trim()
-      if (!ref) return { error: 'page_required' }
-      const root = ref.startsWith('external:')
-        ? await prisma.page.findUnique({ where: { appId_externalId: { appId: auth.appId, externalId: ref.slice(9) } }, select: { id: true } })
-        : await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: ref.toLowerCase() } }, select: { id: true } })
-      if (!root) return { error: 'not_found' }
+      // Alcance: 'scope' (lista de refs) o 'page' (una sola, como antes). Se
+      // admite handle o 'external:<id>': el externalId es estable aunque la app
+      // renombre la page.
+      const a = await resolverAlcance(auth.appId, String(query.scope || query.page || ''))
+      if (!a) return { error: 'not_found' }
+      const pageIds = [...a.ids]
 
-      // La page del scan y todas sus obras.
-      const children = await prisma.page.findMany({ where: { appId: auth.appId, parentPageId: root.id }, select: { id: true } })
-      const pageIds = [root.id, ...children.map((c) => c.id)]
-
-      const limit = Math.min(100, Math.max(1, Number(query.limit) || 30))
+      const limit = Math.min(200, Math.max(1, Number(query.limit) || 30))
       const pg = Math.max(0, Number(query.page_num) || 0)
       const status = String(query.status || 'all')
+      const enScope = { post: { OR: [{ wallPageId: { in: pageIds } }, { authorPageId: { in: pageIds } }] } }
 
-      const where: any = {
-        appId: auth.appId,
-        post: { OR: [{ wallPageId: { in: pageIds } }, { authorPageId: { in: pageIds } }] },
-      }
+      const where: any = { appId: auth.appId, ...enScope }
       if (status === 'hidden') { where.hiddenAt = { not: null }; where.deletedAt = null }
       else if (status === 'deleted') where.deletedAt = { not: null }
       else if (status === 'active') { where.hiddenAt = null; where.deletedAt = null }
       else where.deletedAt = null
       if (query.q) where.content = { contains: String(query.q), mode: 'insensitive' }
+      if (query.author) {
+        const au = String(query.author)
+        where.author = au.startsWith('external:') ? { externalId: au.slice(9) } : { handle: au.toLowerCase() }
+      }
+      if (query.post_id) where.postId = Number(query.post_id)
+      if (query.replies === 'only') where.parentCommentId = { not: null }
+      else if (query.replies === 'none') where.parentCommentId = null
+      if (query.from || query.to) where.createdAt = { ...(query.from ? { gte: new Date(query.from) } : {}), ...(query.to ? { lte: new Date(query.to) } : {}) }
 
-      const [rows, total, hidden] = await Promise.all([
+      const orden: Record<string, any> = {
+        recientes: [{ createdAt: 'desc' }],
+        antiguos: [{ createdAt: 'asc' }],
+        populares: [{ likesCount: 'desc' }, { createdAt: 'desc' }],
+        menos_populares: [{ likesCount: 'asc' }, { createdAt: 'desc' }],
+      }
+      const orderBy = orden[String(query.sort || 'recientes')] || orden.recientes
+
+      const base = { appId: auth.appId, ...enScope }
+      const [rows, total, activos, ocultos, borrados] = await Promise.all([
         prisma.comment.findMany({
-          where, orderBy: { createdAt: 'desc' }, skip: pg * limit, take: limit + 1,
+          where, orderBy, skip: pg * limit, take: limit + 1,
           include: {
             author: { select: pageSel },
-            post: { select: { id: true, content: true, externalRef: true, wall: { select: { handle: true, displayName: true } } } },
+            post: { select: { id: true, content: true, externalRef: true, wall: { select: wallSel } } },
           },
         }),
-        prisma.comment.count({ where: { appId: auth.appId, deletedAt: null, post: { OR: [{ wallPageId: { in: pageIds } }, { authorPageId: { in: pageIds } }] } } }),
-        prisma.comment.count({ where: { appId: auth.appId, deletedAt: null, hiddenAt: { not: null }, post: { OR: [{ wallPageId: { in: pageIds } }, { authorPageId: { in: pageIds } }] } } }),
+        prisma.comment.count({ where }),
+        prisma.comment.count({ where: { ...base, deletedAt: null, hiddenAt: null } }),
+        prisma.comment.count({ where: { ...base, deletedAt: null, hiddenAt: { not: null } } }),
+        prisma.comment.count({ where: { ...base, deletedAt: { not: null } } }),
       ])
 
       const hasMore = rows.length > limit
@@ -1682,7 +1855,9 @@ export const v1 = () =>
           })),
           hasMore,
           total,
-          hidden,
+          // Conteos del alcance completo (sin filtros), para las pestañas.
+          counts: { active: activos, hidden: ocultos, deleted: borrados, all: activos + ocultos },
+          hidden: ocultos,
         },
       }
     })
