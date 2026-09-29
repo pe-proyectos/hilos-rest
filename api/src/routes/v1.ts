@@ -1770,6 +1770,34 @@ export const v1 = () =>
           .sort((x, y) => String(y.at).localeCompare(String(x.at)))
         return { data: { scope: a.roots[0], items } }
       }
+      // Historial de varias personas a la vez (lista de moderación, usuarios de
+      // un scan). Es visible entre scans: así cada scan sabe si alguien ya
+      // tuvo mala conducta en otro lado. targets = handles o external:<id>.
+      if (query.targets) {
+        const refs = String(query.targets).split(',').map((r) => r.trim()).filter(Boolean).slice(0, 200)
+        const ext = refs.filter((r) => r.startsWith('external:')).map((r) => r.slice(9))
+        const handles = refs.filter((r) => !r.startsWith('external:')).map((r) => r.toLowerCase())
+        const pages = await prisma.page.findMany({
+          where: { appId: auth.appId, OR: [{ externalId: { in: ext } }, { handle: { in: handles } }] },
+          select: { id: true, handle: true, externalId: true },
+        })
+        if (!pages.length) return { data: { items: {} } }
+        const keys = pages.map((p) => String(p.id))
+        const rows = await prisma.$queryRaw<Array<{ id: number; handle: string; displayName: string | null; avatarUrl: string | null; externalId: string | null; mutes: any }>>`
+          SELECT id, handle, "displayName", "avatarUrl", "externalId", metadata->'mutes' AS mutes
+          FROM "page" WHERE "appId" = ${auth.appId} AND metadata->'mutes' ?| ${keys}::text[]`
+        const items: Record<string, any[]> = {}
+        for (const p of pages) {
+          const lista = rows
+            .filter((r) => r.mutes && r.mutes[String(p.id)])
+            .map((r) => ({ scope: { id: r.id, handle: r.handle, displayName: r.displayName, avatarUrl: r.avatarUrl, externalId: r.externalId }, ...(r.mutes[String(p.id)] as Silencio), active: silencioVigente(r.mutes[String(p.id)]) }))
+          if (lista.length) {
+            if (p.externalId) items[`external:${p.externalId}`] = lista
+            items[p.handle] = lista
+          }
+        }
+        return { data: { items } }
+      }
       if (query.target) {
         const ref = String(query.target)
         const target = ref.startsWith('external:')
