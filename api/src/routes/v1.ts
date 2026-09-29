@@ -1,10 +1,12 @@
 import { Elysia, t } from 'elysia'
 import { prisma } from '../lib/prisma'
-import { resolveAuth, actingPage, viewerPage, requireScope, rateLimit, CLIENT_SCOPES, type AuthCtx } from '../plugins/auth'
+import { resolveAuth, actingPage, viewerPage, requireScope, canWrite, rateLimit, CLIENT_SCOPES, type AuthCtx } from '../plugins/auth'
+import { imagenDeTipo, detectarImagen, nombreSeguro, fechaNoFutura } from '../lib/seguridad'
 import { signJwt, generateApiKey } from '../lib/crypto'
 import { s3, R2_PUBLIC } from '../lib/s3'
 import { cifrar, descifrar } from '../lib/secret'
 import { randomBytes, createHmac } from 'crypto'
+import { listInbox, inboxCounts, buildSummaries, messageMeta, messageMedia, engagedConversations } from '../lib/inbox'
 
 const SECRET = process.env.HILOS_JWT_SECRET || 'dev-secret'
 const MAX_CONTENT = 8000
@@ -445,13 +447,15 @@ export const v1 = () =>
     // URL prefirmada para subir media (imagenes de posts/comentarios).
     .post('/uploads', async ({ auth, body }: any) => {
       if (!auth) return { error: 'unauthorized' }
-      // Subidas desde el navegador: hace falta permiso de escritura.
-      if (auth.mode === 'page' && !(requireScope(auth, 'post:write') || requireScope(auth, 'comment:write'))) return { error: 'insufficient_scope' }
+      // Un PUT prefirmado no puede acotar el tamaño ni comprobar lo que se sube:
+      // solo para el backend de la app. El navegador sube por /uploads/direct.
+      if (auth.mode !== 'secret') return { error: 'secret_key_required' }
+      const img = imagenDeTipo(body.contentType)
+      if (!img) return { error: 'only_images' }
       const c = s3(); if (!c) return { error: 'storage_not_configured' }
-      const name = String(body.filename || 'file').replace(/[^a-zA-Z0-9._-]/g, '_').slice(-60)
-      const ct = String(body.contentType || 'application/octet-stream')
+      const name = nombreSeguro(body.filename, img.ext)
       const key = `${auth.appId}/media/${Date.now()}-${randomBytes(6).toString('hex')}-${name}`
-      const uploadUrl = c.presign(key, { method: 'PUT', expiresIn: 900, type: ct })
+      const uploadUrl = c.presign(key, { method: 'PUT', expiresIn: 900, type: img.type })
       return { data: { uploadUrl, key, publicUrl: `${R2_PUBLIC}/${key}`, expiresIn: 900 } }
     }, { body: t.Object({ filename: t.Optional(t.String()), contentType: t.Optional(t.String()) }) })
 
@@ -460,8 +464,9 @@ export const v1 = () =>
     // el archivo entra por aquí y hilos lo guarda.
     .post('/uploads/direct', async ({ auth, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
-      if (auth.mode === 'page' && !(requireScope(auth, 'post:write') || requireScope(auth, 'comment:write'))) return { error: 'insufficient_scope' }
-      const c = s3(); if (!c) return { error: 'storage_not_configured' }
+      // Secret key o page token con escritura; la clave pública no sube nada.
+      if (!canWrite(auth)) return { error: 'insufficient_scope' }
+      if (auth.mode === 'page' && !rateLimit(`upload:${auth.pageId}`, 60, 10 * 60_000)) return { error: 'rate_limited' }
 
       let file: any = null
       try {
@@ -470,15 +475,22 @@ export const v1 = () =>
       } catch { return { error: 'invalid_form' } }
       if (!file || typeof file === 'string') return { error: 'no_file' }
 
-      const type = String(file.type || 'application/octet-stream')
-      if (!type.startsWith('image/')) return { error: 'only_images' }
-      if (file.size > 8 * 1024 * 1024) return { error: 'file_too_large' }
+      const MAX_BYTES = 8 * 1024 * 1024
+      if (file.size > MAX_BYTES) return { error: 'file_too_large' }
+      let bytes: Uint8Array
+      try { bytes = new Uint8Array(await file.arrayBuffer()) } catch { return { error: 'invalid_form' } }
+      if (bytes.byteLength > MAX_BYTES) return { error: 'file_too_large' }
 
-      const name = String(file.name || 'file').replace(/[^a-zA-Z0-9._-]/g, '_').slice(-60)
+      // El tipo sale de los bytes, no del cliente: solo imágenes rasterizadas
+      // (nada de SVG ni HTML servido desde el dominio de media).
+      const img = detectarImagen(bytes)
+      if (!img) return { error: 'only_images' }
+
+      const c = s3(); if (!c) return { error: 'storage_not_configured' }
+      const name = nombreSeguro(file.name, img.ext)
       const key = `${auth.appId}/media/${Date.now()}-${randomBytes(6).toString('hex')}-${name}`
       try {
-        const bytes = new Uint8Array(await file.arrayBuffer())
-        await c.write(key, bytes, { type })
+        await c.write(key, bytes, { type: img.type })
         return { data: { key, publicUrl: `${R2_PUBLIC}/${key}` } }
       } catch (e: any) {
         return { error: 'upload_failed' }
@@ -907,7 +919,10 @@ export const v1 = () =>
       let authorPageId: number
       try { authorPageId = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
       if (auth.mode === 'page' && !rateLimit(`post:${authorPageId}`, 10, 5 * 60_000)) return { error: 'rate_limited' }
-      if (auth.mode === 'page' && await isMuted(authorPageId)) return { error: 'muted' }
+      // Los silencios valen para la page que actúa, venga con page token o con
+      // la secret key + X-Hilos-Page (un backend que reenvía la acción).
+      if (await isMuted(authorPageId)) return { error: 'muted' }
+      const secreta = auth.mode === 'secret'
       const content = String(body.content || '').slice(0, MAX_CONTENT)
       if (!content.trim() && !body.media && !body.repostOfId) return { error: 'empty_post' }
       let wallPageId = authorPageId
@@ -919,13 +934,24 @@ export const v1 = () =>
         wallPageId = w.id
       }
       // Publicar en el muro de un scan (o de sus obras) donde te silenciaron.
-      if (auth.mode === 'page' && wallPageId !== authorPageId) {
+      if (wallPageId !== authorPageId) {
         const sil = await silencioEnMuro(auth.appId, authorPageId, wallPageId)
         if (sil) return { error: 'muted_scope', until: sil.until, scope: sil.scope }
       }
-      // Dedupe por externalRef (auto-post/migracion idempotente).
-      if (body.externalRef) {
-        const dup = await prisma.post.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef: String(body.externalRef) } }, include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true } }).catch(() => null)
+      // externalRef, metadata y createdAt son cosa de la app (auto-posts,
+      // migraciones): con page token se ignoran. La fecha nunca va al futuro.
+      const externalRef = secreta && body.externalRef ? String(body.externalRef) : null
+      let createdAt: Date | undefined
+      if (secreta && body.createdAt) {
+        const d = fechaNoFutura(body.createdAt)
+        if (!d) return { error: 'bad_created_at' }
+        createdAt = d
+      }
+      // Dedupe por externalRef (auto-post/migracion idempotente). Solo es el
+      // mismo post si lo publicó la misma page; si no, la referencia es de otro.
+      if (externalRef) {
+        const dup = await prisma.post.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef } }, include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true } }).catch(() => null)
+        if (dup && dup.authorPageId !== authorPageId) return { error: 'external_ref_taken', postId: dup.id }
         if (dup) return { data: shapePost(dup), deduped: true }
       }
       // Un mensaje programado se guarda cifrado y con un aviso en su lugar.
@@ -941,8 +967,8 @@ export const v1 = () =>
         ...(programado ? { revealAt, secretContent: cifrar(content) } : {}),
         ...(body.countdownAt ? { countdownAt: new Date(body.countdownAt), countdownLabel: body.countdownLabel ? String(body.countdownLabel).slice(0, 120) : null } : {}),
         media: body.media ?? undefined,
-        repostOfId: body.repostOfId ? Number(body.repostOfId) : null, externalRef: body.externalRef ? String(body.externalRef) : null,
-        metadata: body.metadata ?? undefined, createdAt: body.createdAt ? new Date(body.createdAt) : undefined,
+        repostOfId: body.repostOfId ? Number(body.repostOfId) : null, externalRef,
+        metadata: secreta ? (body.metadata ?? undefined) : undefined, createdAt,
       }, include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true } })
       notifyMentions(auth.appId, content, authorPageId, { postId: post.id })
       // La encuesta se crea con el post: sin post no hay dónde votar.
@@ -1000,13 +1026,27 @@ export const v1 = () =>
 
     .patch('/posts/:id', async ({ auth, params, body, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
-      const post = await prisma.post.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, select: { id: true, authorPageId: true } })
+      const post = await prisma.post.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, select: { id: true, authorPageId: true, wallPageId: true } })
       if (!post) return { error: 'not_found' }
+      // Page en cuyo nombre se edita: el page token, o la secret key con
+      // X-Hilos-Page. La secret key sin cabecera es la propia app (moderación).
+      let actor: number | null = null
       if (auth.mode !== 'secret') {
         if (!requireScope(auth, 'post:write')) return { error: 'insufficient_scope' }
         let me: number
         try { me = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
         if (me !== post.authorPageId) return { error: 'forbidden' }
+        actor = me
+      } else if (request.headers.get('x-hilos-page')) {
+        actor = await viewerPage(auth, request.headers)
+      }
+      // Silenciado (en toda la app o en el scan del muro): no reescribe lo publicado.
+      if (actor != null) {
+        if (await isMuted(actor)) return { error: 'muted' }
+        if (post.wallPageId && post.wallPageId !== actor) {
+          const sil = await silencioEnMuro(auth.appId, actor, post.wallPageId)
+          if (sil) return { error: 'muted_scope', until: sil.until, scope: sil.scope }
+        }
       }
       const data: any = {}
       if (body.content !== undefined) {
@@ -1017,6 +1057,11 @@ export const v1 = () =>
       if (body.wallExternalId) {
         const wall = await prisma.page.findUnique({ where: { appId_externalId: { appId: auth.appId, externalId: String(body.wallExternalId) } }, select: { id: true } })
         if (!wall) return { error: 'wall_not_found' }
+        // Mover el post a un muro donde te silenciaron es publicar ahí.
+        if (actor != null && wall.id !== actor) {
+          const sil = await silencioEnMuro(auth.appId, actor, wall.id)
+          if (sil) return { error: 'muted_scope', until: sil.until, scope: sil.scope }
+        }
         data.wallPageId = wall.id
       }
       if (!Object.keys(data).length) return { error: 'nothing_to_update' }
@@ -1109,7 +1154,7 @@ export const v1 = () =>
             AND "createdAt" > NOW() - (${days} || ' days')::interval
           ORDER BY (
             ("likesCount" * 3 + "commentsCount" * 5 + 1)::float
-            / POWER((EXTRACT(EPOCH FROM (NOW() - "createdAt")) / 3600.0) + 2.0, 1.4)
+            / POWER(GREATEST(EXTRACT(EPOCH FROM (NOW() - "createdAt")) / 3600.0, 0) + 2.0, 1.4)
           ) DESC, "createdAt" DESC
           LIMIT ${limit + 1} OFFSET ${pg * limit}`
         const ids = ranked.map((r) => r.id)
@@ -1300,12 +1345,14 @@ export const v1 = () =>
         (await prisma.follow.findMany({ where: { appId: auth.appId, followerPageId: me, followedPageId: { in: otherIds } }, select: { followedPageId: true } }))
           .map((f) => f.followedPageId),
       )
+      // Si ya escribiste en la conversación, la aceptaste: se lee sin seguir.
+      const engaged = await engagedConversations(me, items.map((r) => r.conversationId))
 
       const out = []
       for (const r of items) {
         const other = r.conversation.members.find((m) => m.pageId !== me)
         if (!other) continue
-        const canRead = following.has(other.pageId)
+        const canRead = following.has(other.pageId) || engaged.has(r.conversationId)
         const last = canRead
           ? await prisma.message.findFirst({ where: { conversationId: r.conversationId, deletedAt: null }, orderBy: { createdAt: 'desc' }, select: { content: true, createdAt: true, senderPageId: true } })
           : null
@@ -1390,7 +1437,8 @@ export const v1 = () =>
       if (!other) return { error: 'not_found' }
 
       const follows = await prisma.follow.findFirst({ where: { appId: auth.appId, followerPageId: me, followedPageId: other.pageId }, select: { id: true } })
-      if (!follows) return { data: { items: [], hasMore: false, canRead: false, canWrite: false, page: shapePage(other.page) } }
+      const engaged = !follows && (await engagedConversations(me, [conversationId])).has(conversationId)
+      if (!follows && !engaged) return { data: { items: [], hasMore: false, canRead: false, canWrite: false, page: shapePage(other.page) } }
 
       const limit = Math.min(100, Number(query.limit) || 40)
       const pg = Math.max(0, Number(query.page) || 0)
@@ -1400,44 +1448,114 @@ export const v1 = () =>
         select: { id: true, content: true, media: true, createdAt: true, senderPageId: true },
       })
       const hasMore = rows.length > limit
-      const items = rows.slice(0, limit).reverse().map((m) => ({ id: m.id, content: m.content, media: m.media, createdAt: m.createdAt, mine: m.senderPageId === me }))
+      // meta interno (quién del equipo respondió, referencias de importación)
+      // no sale por aquí: solo el tema que abre el mensaje, si lo hay.
+      const items = rows.slice(0, limit).reverse().map((m) => ({ id: m.id, content: m.content, media: messageMedia(m.media), topic: messageMeta(m.media)?.topic ?? null, createdAt: m.createdAt, mine: m.senderPageId === me }))
 
       if (pg === 0) await prisma.conversationMember.update({ where: { id: member.id }, data: { lastReadAt: new Date() } }).catch(() => {})
       return { data: { items, hasMore, canRead: true, canWrite: true, page: shapePage(other.page) } }
     })
 
-    // Enviar mensaje a una page por handle. Crea la conversacion si hace falta.
+    // Enviar mensaje a una page (por handle; con secret key también por `to`
+    // = external:<id> | <id> | handle). Crea la conversacion si hace falta.
+    // Solo con secret key (la app consumidora decide sus propias reglas):
+    //   - no exige seguir a la otra page;
+    //   - meta: datos del mensaje (meta.topic = { tag, title, ref } abre un tema);
+    //   - externalRef: idempotencia (importaciones); si ya existe, lo devuelve;
+    //   - createdAt: fecha original (importaciones);
+    //   - notify: false para no avisar; reopen: true desarchiva para todos.
     .post('/messages', async ({ auth, body, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
       if (!requireScope(auth, 'comment:write')) return { error: 'insufficient_scope' }
       let me: number
       try { me = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
       if (auth.mode === 'page' && !rateLimit(`dm:${me}`, 60, 60_000)) return { error: 'rate_limited' }
+      const secret = auth.mode === 'secret'
 
-      const target = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: String(body.handle).toLowerCase() } }, select: { id: true, type: true } })
+      let target: { id: number; type: string } | null = null
+      if (secret && body.to) {
+        const ref = String(body.to).trim()
+        if (ref.startsWith('external:')) target = await prisma.page.findUnique({ where: { appId_externalId: { appId: auth.appId, externalId: ref.slice(9) } }, select: { id: true, type: true } })
+        else if (/^\d+$/.test(ref)) target = await prisma.page.findFirst({ where: { id: Number(ref), appId: auth.appId }, select: { id: true, type: true } })
+        else target = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: ref.toLowerCase() } }, select: { id: true, type: true } })
+      } else if (body.handle) {
+        target = await prisma.page.findUnique({ where: { appId_handle: { appId: auth.appId, handle: String(body.handle).toLowerCase() } }, select: { id: true, type: true } })
+      }
       if (!target) return { error: 'page_not_found' }
       if (target.id === me) return { error: 'cannot_message_self' }
 
-      // Solo puedes escribir a quien sigues.
-      const follows = await prisma.follow.findFirst({ where: { appId: auth.appId, followerPageId: me, followedPageId: target.id }, select: { id: true } })
-      if (!follows) return { error: 'must_follow_first' }
+      const [a, b] = me < target.id ? [me, target.id] : [target.id, me]
+      let conv = await prisma.conversation.findUnique({ where: { appId_pageAId_pageBId: { appId: auth.appId, pageAId: a, pageBId: b } }, select: { id: true, lastMessageAt: true } })
 
-      const content = String(body.content || '').trim().slice(0, 4000)
+      // Solo puedes escribir a quien sigues (o donde ya escribiste antes).
+      if (!secret) {
+        const follows = await prisma.follow.findFirst({ where: { appId: auth.appId, followerPageId: me, followedPageId: target.id }, select: { id: true } })
+        const engaged = !follows && conv ? (await engagedConversations(me, [conv.id])).has(conv.id) : false
+        if (!follows && !engaged) return { error: 'must_follow_first' }
+      }
+
+      const content = String(body.content || '').trim().slice(0, secret ? MAX_CONTENT : 4000)
       if (!content) return { error: 'empty_message' }
 
-      const [a, b] = me < target.id ? [me, target.id] : [target.id, me]
-      let conv = await prisma.conversation.findUnique({ where: { appId_pageAId_pageBId: { appId: auth.appId, pageAId: a, pageBId: b } }, select: { id: true } })
+      let meta: any = null
+      if (secret && body.meta && typeof body.meta === 'object' && !Array.isArray(body.meta)) {
+        if (JSON.stringify(body.meta).length > 4000) return { error: 'meta_too_large' }
+        meta = { ...body.meta }
+      }
+      const externalRef = secret && body.externalRef ? String(body.externalRef).slice(0, 256) : null
+      if (externalRef) meta = { ...(meta || {}), ref: externalRef }
+      let createdAt: Date | undefined
+      if (secret && body.createdAt) {
+        const d = new Date(body.createdAt)
+        if (Number.isNaN(d.getTime())) return { error: 'bad_created_at' }
+        createdAt = d
+      }
+
+      // Idempotencia: la misma referencia en la misma conversación no se duplica.
+      if (externalRef && conv) {
+        const dup = await prisma.message.findFirst({
+          where: { conversationId: conv.id, media: { path: ['meta', 'ref'], equals: externalRef } },
+          select: { id: true, content: true, media: true, createdAt: true },
+        })
+        if (dup) return { data: { id: dup.id, content: dup.content, media: messageMedia(dup.media), meta: messageMeta(dup.media), createdAt: dup.createdAt, mine: true, conversationId: conv.id, duplicate: true } }
+      }
+
       if (!conv) {
         conv = await prisma.conversation.create({
-          data: { appId: auth.appId, pageAId: a, pageBId: b, members: { create: [{ pageId: a }, { pageId: b }] } },
-          select: { id: true },
-        })
+          data: {
+            appId: auth.appId, pageAId: a, pageBId: b, members: { create: [{ pageId: a }, { pageId: b }] },
+            ...(createdAt ? { createdAt, lastMessageAt: createdAt } : {}),
+          },
+          select: { id: true, lastMessageAt: true },
+        }).catch(async () => prisma.conversation.findUnique({ where: { appId_pageAId_pageBId: { appId: auth.appId, pageAId: a, pageBId: b } }, select: { id: true, lastMessageAt: true } }))
+        if (!conv) return { error: 'conversation_failed' }
       }
-      const msg = await prisma.message.create({ data: { appId: auth.appId, conversationId: conv.id, senderPageId: me, content, media: body.media ?? undefined }, select: { id: true, content: true, media: true, createdAt: true } })
-      await prisma.conversation.update({ where: { id: conv.id }, data: { lastMessageAt: msg.createdAt } }).catch(() => {})
-      notify(auth.appId, target.id, me, 'message', { preview: content })
-      return { data: { ...msg, mine: true, conversationId: conv.id } }
-    }, { body: t.Object({ handle: t.String(), content: t.String(), media: t.Optional(t.Any()) }) })
+      const media = meta ? { meta, ...(body.media != null ? { items: body.media } : {}) } : (body.media ?? undefined)
+      const msg = await prisma.message.create({
+        data: { appId: auth.appId, conversationId: conv.id, senderPageId: me, content, media, ...(createdAt ? { createdAt } : {}) },
+        select: { id: true, content: true, media: true, createdAt: true },
+      })
+      // La última actividad nunca retrocede (una importación puede traer fechas viejas).
+      if (!conv.lastMessageAt || msg.createdAt > conv.lastMessageAt || !createdAt) {
+        await prisma.conversation.update({ where: { id: conv.id }, data: { lastMessageAt: msg.createdAt } }).catch(() => {})
+      }
+      // Quien escribe ya leyó todo lo anterior.
+      await prisma.conversationMember.updateMany({
+        where: { conversationId: conv.id, pageId: me, OR: [{ lastReadAt: null }, { lastReadAt: { lt: msg.createdAt } }] },
+        data: { lastReadAt: msg.createdAt },
+      }).catch(() => {})
+      if (secret && body.reopen === true) {
+        await prisma.conversationMember.updateMany({ where: { conversationId: conv.id, archivedAt: { not: null } }, data: { archivedAt: null } }).catch(() => {})
+      }
+      if (!(secret && body.notify === false)) notify(auth.appId, target.id, me, 'message', { preview: content })
+      return { data: { id: msg.id, content: msg.content, media: messageMedia(msg.media), ...(secret ? { meta: messageMeta(msg.media) } : { topic: messageMeta(msg.media)?.topic ?? null }), createdAt: msg.createdAt, mine: true, conversationId: conv.id } }
+    }, {
+      body: t.Object({
+        handle: t.Optional(t.String()), to: t.Optional(t.String()), content: t.String(), media: t.Optional(t.Any()),
+        meta: t.Optional(t.Any()), externalRef: t.Optional(t.String()), createdAt: t.Optional(t.String()),
+        notify: t.Optional(t.Boolean()), reopen: t.Optional(t.Boolean()),
+      }),
+    })
 
     // Sondeo ligero para el widget flotante: cuantos mensajes sin leer hay y
     // cual fue el ultimo movimiento (para no recargar listas sin necesidad).
@@ -1455,16 +1573,106 @@ export const v1 = () =>
         (await prisma.follow.findMany({ where: { appId: auth.appId, followerPageId: me, followedPageId: { in: others } }, select: { followedPageId: true } }))
           .map((f) => f.followedPageId),
       )
+      const engaged = await engagedConversations(me, members.map((m) => m.conversationId))
       let total = 0
       let lastMessageAt: Date | null = null
       for (const m of members) {
         const other = m.conversation.pageAId === me ? m.conversation.pageBId : m.conversation.pageAId
-        if (!following.has(other)) continue
+        if (!following.has(other) && !engaged.has(m.conversationId)) continue
         if (!lastMessageAt || m.conversation.lastMessageAt > lastMessageAt) lastMessageAt = m.conversation.lastMessageAt
         total += await prisma.message.count({ where: { conversationId: m.conversationId, deletedAt: null, senderPageId: { not: me }, ...(m.lastReadAt ? { createdAt: { gt: m.lastReadAt } } : {}) } })
       }
       return { data: { total, lastMessageAt } }
     })
+
+    // ---- Bandeja (solo secret key) ----
+    // Para apps que atienden conversaciones en nombre de una page (el staff de
+    // un scan, soporte). La app consumidora aplica sus propios permisos; por
+    // eso aquí no rige la regla de seguir, y todo exige la secret key.
+    .get('/inbox', async ({ auth, query, request }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      let me: number
+      try { me = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+      let withPageId: number | null = null
+      if (query.with) {
+        try { withPageId = await actingPage(auth, new Headers({ 'x-hilos-page': String(query.with) })) } catch { return { data: { items: [], total: 0, page: 0, limit: 0, counts: { open: 0, archived: 0, all: 0, unread: 0 } } } }
+      }
+      const r = await listInbox(auth.appId, me, {
+        status: ['open', 'archived', 'all'].includes(query.status) ? query.status : 'all',
+        unread: query.unread === '1' || query.unread === 'true',
+        tag: query.tag ? String(query.tag).slice(0, 64) : null,
+        q: query.q ? String(query.q) : null,
+        sort: ['recent', 'oldest', 'unread'].includes(query.sort) ? query.sort : 'recent',
+        type: query.type ? String(query.type).slice(0, 24) : null,
+        withPageId,
+        page: Number(query.page) || 0,
+        limit: Number(query.limit) || 20,
+      })
+      const items = await buildSummaries(me, r.rows, pageSel, shapePage)
+      return { data: { items, total: r.total, page: r.page, limit: r.limit, counts: r.counts } }
+    })
+
+    .get('/inbox/counts', async ({ auth, query, request }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      let me: number
+      try { me = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+      return { data: await inboxCounts(auth.appId, me, query.type ? String(query.type).slice(0, 24) : null) }
+    })
+
+    // Resumen de una conversación de la page (sin marcar nada como leído).
+    .get('/inbox/:id', async ({ auth, params, request }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      let me: number
+      try { me = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+      const r = await listInbox(auth.appId, me, { conversationId: Number(params.id) || -1, limit: 1 })
+      if (!r.rows.length) return { error: 'not_found' }
+      const [item] = await buildSummaries(me, r.rows, pageSel, shapePage)
+      return { data: item }
+    })
+
+    // Mensajes (más recientes primero para paginar hacia atrás; cada página
+    // sale en orden cronológico). markRead=0 para mirar sin marcar leído.
+    .get('/inbox/:id/messages', async ({ auth, params, query, request }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      let me: number
+      try { me = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+      const conversationId = Number(params.id)
+      const member = await prisma.conversationMember.findUnique({ where: { conversationId_pageId: { conversationId, pageId: me } }, select: { id: true } })
+      if (!member) return { error: 'not_found' }
+      const limit = Math.min(200, Math.max(1, Number(query.limit) || 50))
+      const pg = Math.max(0, Number(query.page) || 0)
+      const rows = await prisma.message.findMany({
+        where: { conversationId, deletedAt: null },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], skip: pg * limit, take: limit + 1,
+        select: { id: true, content: true, media: true, createdAt: true, senderPageId: true },
+      })
+      const hasMore = rows.length > limit
+      const items = rows.slice(0, limit).reverse().map((m) => ({
+        id: m.id, content: m.content, media: messageMedia(m.media), meta: messageMeta(m.media),
+        createdAt: m.createdAt, mine: m.senderPageId === me, senderPageId: m.senderPageId,
+      }))
+      if (pg === 0 && query.markRead !== '0' && query.markRead !== 'false') {
+        await prisma.conversationMember.update({ where: { id: member.id }, data: { lastReadAt: new Date() } }).catch(() => {})
+      }
+      const r = await listInbox(auth.appId, me, { conversationId, limit: 1 })
+      const [conversation] = await buildSummaries(me, r.rows, pageSel, shapePage)
+      return { data: { conversation: conversation ?? null, items, hasMore } }
+    })
+
+    // Marca leída la conversación para la page (hasta `at`, o ahora). Sirve
+    // también para importar el estado de lectura de otro sistema.
+    .post('/inbox/:id/read', async ({ auth, params, body, request }: any) => {
+      if (!auth || auth.mode !== 'secret') return { error: 'secret_key_required' }
+      let me: number
+      try { me = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
+      const conversationId = Number(params.id)
+      const member = await prisma.conversationMember.findUnique({ where: { conversationId_pageId: { conversationId, pageId: me } }, select: { id: true } })
+      if (!member) return { error: 'not_found' }
+      let at = new Date()
+      if (body?.at) { at = new Date(body.at); if (Number.isNaN(at.getTime())) return { error: 'bad_at' } }
+      await prisma.conversationMember.update({ where: { id: member.id }, data: { lastReadAt: at } })
+      return { data: { id: conversationId, lastReadAt: at } }
+    }, { body: t.Optional(t.Object({ at: t.Optional(t.String()) })) })
 
     // ---- Comments ----
     .get('/posts/:id/comments', async ({ auth, params, query, request }: any) => {
@@ -1513,28 +1721,50 @@ export const v1 = () =>
       let authorPageId: number
       try { authorPageId = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
       if (auth.mode === 'page' && !rateLimit(`comment:${authorPageId}`, 30, 5 * 60_000)) return { error: 'rate_limited' }
-      if (auth.mode === 'page' && await isMuted(authorPageId)) return { error: 'muted' }
+      // Silencios de la page que actúa, también con secret key + X-Hilos-Page.
+      if (await isMuted(authorPageId)) return { error: 'muted' }
       const post = await prisma.post.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, select: { id: true, wallPageId: true } })
       if (!post) return { error: 'post_not_found' }
       // Silenciado por el scan dueño de ese muro (solo ahí, no en toda la app).
-      if (auth.mode === 'page' && post.wallPageId) {
+      if (post.wallPageId) {
         const sil = await silencioEnMuro(auth.appId, authorPageId, post.wallPageId)
         if (sil) return { error: 'muted_scope', until: sil.until, scope: sil.scope }
       }
       const content = String(body.content || '').trim().slice(0, MAX_CONTENT)
       if (!content) return { error: 'empty_comment' }
-      // Dedupe por externalRef (migraciones idempotentes).
-      if (body.externalRef) {
-        const dup = await prisma.comment.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef: String(body.externalRef) } }, include: { author: { select: pageSel } } }).catch(() => null)
+      // externalRef y createdAt solo los fija la app (migraciones); con page
+      // token se ignoran. La fecha nunca va al futuro.
+      const secreta = auth.mode === 'secret'
+      const externalRef = secreta && body.externalRef ? String(body.externalRef) : null
+      let createdAt: Date | undefined
+      if (secreta && body.createdAt) {
+        const d = fechaNoFutura(body.createdAt)
+        if (!d) return { error: 'bad_created_at' }
+        createdAt = d
+      }
+      // Dedupe por externalRef (migraciones idempotentes), solo del mismo autor.
+      if (externalRef) {
+        const dup = await prisma.comment.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef } }, include: { author: { select: pageSel } } }).catch(() => null)
+        if (dup && dup.authorPageId !== authorPageId) return { error: 'external_ref_taken', commentId: dup.id }
         if (dup) return { data: { id: dup.id, content: dup.content, parentCommentId: dup.parentCommentId, likesCount: dup.likesCount, createdAt: dup.createdAt, author: shapePage(dup.author) }, deduped: true }
       }
-      // El padre puede venir por id propio o por su externalRef original.
-      let parentCommentId: number | null = body.parentCommentId ? Number(body.parentCommentId) : null
-      if (!parentCommentId && body.parentExternalRef) {
-        const p = await prisma.comment.findUnique({ where: { appId_externalRef: { appId: auth.appId, externalRef: String(body.parentExternalRef) } }, select: { id: true } }).catch(() => null)
+      // El padre puede venir por id propio o por su externalRef original, pero
+      // siempre de esta misma conversación: nada de avisar a quien no está en ella.
+      let parentCommentId: number | null = null
+      if (body.parentCommentId) {
+        const pid = Number(body.parentCommentId)
+        const p = Number.isSafeInteger(pid) && pid > 0
+          ? await prisma.comment.findFirst({ where: { id: pid, postId: post.id, appId: auth.appId, deletedAt: null }, select: { id: true } })
+          : null
+        if (!p) return { error: 'parent_not_found' }
+        parentCommentId = p.id
+      } else if (body.parentExternalRef) {
+        // Importaciones: si el padre no está en este post queda como comentario
+        // raíz, igual que antes cuando no existía.
+        const p = await prisma.comment.findFirst({ where: { appId: auth.appId, externalRef: String(body.parentExternalRef), postId: post.id, deletedAt: null }, select: { id: true } }).catch(() => null)
         parentCommentId = p?.id ?? null
       }
-      const c = await prisma.comment.create({ data: { appId: auth.appId, postId: post.id, authorPageId, parentCommentId, externalRef: body.externalRef ? String(body.externalRef) : null, content, createdAt: body.createdAt ? new Date(body.createdAt) : undefined }, include: { author: { select: pageSel } } })
+      const c = await prisma.comment.create({ data: { appId: auth.appId, postId: post.id, authorPageId, parentCommentId, externalRef, content, createdAt }, include: { author: { select: pageSel } } })
       await prisma.post.update({ where: { id: post.id }, data: { commentsCount: { increment: 1 } } })
 
       // Avisos: al autor del post y, si es una respuesta, a quien respondes.
@@ -1649,13 +1879,26 @@ export const v1 = () =>
 
     .patch('/comments/:id', async ({ auth, params, body, request }: any) => {
       if (!auth) return { error: 'unauthorized' }
-      const c = await prisma.comment.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, select: { id: true, authorPageId: true } })
+      const c = await prisma.comment.findFirst({ where: { id: Number(params.id), appId: auth.appId, deletedAt: null }, select: { id: true, authorPageId: true, post: { select: { wallPageId: true } } } })
       if (!c) return { error: 'not_found' }
+      // Igual que al editar un post: quien actúa (page token o secret key con
+      // X-Hilos-Page) no reescribe comentarios si está silenciado ahí.
+      let actor: number | null = null
       if (auth.mode !== 'secret') {
         if (!requireScope(auth, 'comment:write')) return { error: 'insufficient_scope' }
         let me: number
         try { me = await actingPage(auth, request.headers) } catch (e: any) { return { error: e.message } }
         if (me !== c.authorPageId) return { error: 'forbidden' }
+        actor = me
+      } else if (request.headers.get('x-hilos-page')) {
+        actor = await viewerPage(auth, request.headers)
+      }
+      if (actor != null) {
+        if (await isMuted(actor)) return { error: 'muted' }
+        if (c.post?.wallPageId) {
+          const sil = await silencioEnMuro(auth.appId, actor, c.post.wallPageId)
+          if (sil) return { error: 'muted_scope', until: sil.until, scope: sil.scope }
+        }
       }
       const content = String(body.content || '').trim().slice(0, MAX_CONTENT)
       if (!content) return { error: 'empty_comment' }

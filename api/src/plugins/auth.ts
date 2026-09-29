@@ -60,7 +60,15 @@ export async function resolveAuth(headers: Headers): Promise<AuthCtx | null> {
 
 export function requireScope(auth: AuthCtx, scope: Scope): boolean {
   if (auth.mode === 'secret') return true
+  // La clave pública (pk_) solo lee, pase lo que pase con sus scopes.
+  if (auth.mode === 'public') return scope === 'read'
   return auth.scopes.includes(scope)
+}
+
+// Escribir algo (publicar, comentar, subir media): secret key o page token con
+// permiso de escritura. Nunca la clave pública ni un token de solo lectura.
+export function canWrite(auth: AuthCtx): boolean {
+  return requireScope(auth, 'post:write') || requireScope(auth, 'comment:write')
 }
 
 // Page que actua: token de page, o X-Hilos-Page con secret key.

@@ -25,6 +25,21 @@ Stack: Bun + Elysia + Prisma + PostgreSQL.
 `GET|POST /v1/posts/:id/comments`, `DELETE /v1/comments/:id`,
 `POST /v1/posts/:id/like`, `POST /v1/pages/:handle/follow`.
 
+### Mensajería
+`GET /v1/conversations`, `GET /v1/conversations/:id/messages`,
+`POST /v1/conversations/:id/archive`, `POST /v1/messages`, `GET /v1/messages/unread`.
+Para escribir hay que seguir a la otra page o haber escrito ya en esa conversación.
+
+Con secret key + `X-Hilos-Page` (bandejas de soporte; sin la regla de seguir):
+- `POST /v1/messages` acepta además `to` (external:<id> | id | handle), `meta`
+  (p. ej. `meta.topic = { tag, title, ref }` abre un tema), `externalRef`
+  (idempotente), `createdAt` (importación), `notify: false`, `reopen: true`.
+- `GET /v1/inbox?status=open|archived|all&unread=1&tag=&q=&sort=recent|oldest|unread&type=&with=&page=&limit=`
+  → `{ items, total, page, limit, counts: { open, archived, all, unread } }`.
+- `GET /v1/inbox/counts?type=`, `GET /v1/inbox/:id`,
+  `GET /v1/inbox/:id/messages?page=&limit=&markRead=0`, `POST /v1/inbox/:id/read { at? }`.
+El meta interno solo sale con secret key; con page token solo se ve `topic`.
+
 ## Dev
 ```
 cp .env.example .env   # DATABASE_URL, HILOS_JWT_SECRET

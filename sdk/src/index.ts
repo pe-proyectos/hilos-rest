@@ -63,6 +63,22 @@ export function createHilos(opts: HilosOptions) {
       archive: (conversationId: number, archived = true, acting?: string | number) =>
         req('POST', `/conversations/${conversationId}/archive`, { archived }, acting),
     },
+    // Bandeja con secret key: actúa como una page (acting) sin la regla de seguir.
+    inbox: {
+      list: (q: { status?: 'open' | 'archived' | 'all'; unread?: boolean; tag?: string; q?: string; sort?: 'recent' | 'oldest' | 'unread'; type?: string; with?: string; page?: number; limit?: number } = {}, acting?: string | number) => {
+        const sp = new URLSearchParams()
+        for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== null && v !== '' && v !== false) sp.set(k, v === true ? '1' : String(v))
+        return req('GET', `/inbox?${sp}`, undefined, acting)
+      },
+      counts: (type?: string, acting?: string | number) => req('GET', `/inbox/counts${type ? `?type=${encodeURIComponent(type)}` : ''}`, undefined, acting),
+      get: (conversationId: number, acting?: string | number) => req('GET', `/inbox/${conversationId}`, undefined, acting),
+      messages: (conversationId: number, opt: { page?: number; limit?: number; markRead?: boolean } = {}, acting?: string | number) =>
+        req('GET', `/inbox/${conversationId}/messages?page=${opt.page || 0}&limit=${opt.limit || 50}${opt.markRead === false ? '&markRead=0' : ''}`, undefined, acting),
+      read: (conversationId: number, at?: string, acting?: string | number) => req('POST', `/inbox/${conversationId}/read`, at ? { at } : {}, acting),
+      archive: (conversationId: number, archived = true, acting?: string | number) => req('POST', `/conversations/${conversationId}/archive`, { archived }, acting),
+      send: (p: { to: string; content: string; meta?: any; media?: any; externalRef?: string; createdAt?: string; notify?: boolean; reopen?: boolean }, acting?: string | number) =>
+        req('POST', '/messages', p, acting),
+    },
     members: {
       list: (handle: string, acting?: string | number) => req('GET', `/pages/${encodeURIComponent(handle)}/members`, undefined, acting),
       add: (handle: string, memberHandle: string, role: 'owner' | 'trusted' = 'trusted', acting?: string | number) =>
