@@ -8,6 +8,12 @@ import { cifrar, descifrar } from '../lib/secret'
 import { randomBytes, createHmac } from 'crypto'
 import { listInbox, inboxCounts, buildSummaries, messageMeta, messageMedia, engagedConversations } from '../lib/inbox'
 
+// Avisos automaticos de capitulo nuevo (externalRef 'chapter:<id>'): existen
+// porque de ellos cuelgan las cajas de comentarios de cada capitulo, pero no se
+// muestran en el feed (inicio, siguiendo, recientes): lo llenaban de spam. Ojo:
+// "NOT LIKE" en SQL tambien descarta los NULL, por eso el OR explicito.
+const SIN_AUTOPOSTS = { OR: [{ externalRef: null }, { NOT: { externalRef: { startsWith: 'chapter:' } } }] }
+
 const SECRET = process.env.HILOS_JWT_SECRET || 'dev-secret'
 const MAX_CONTENT = 8000
 
@@ -1128,7 +1134,7 @@ export const v1 = () =>
         const f = await prisma.follow.findMany({ where: { appId: auth.appId, followerPageId: viewer }, select: { followedPageId: true } })
         const ids = [...f.map((x) => x.followedPageId), viewer]
         const rows = await prisma.post.findMany({
-          where: { appId: auth.appId, deletedAt: null, hiddenAt: null, OR: [{ authorPageId: { in: ids } }, { wallPageId: { in: ids } }] },
+          where: { appId: auth.appId, deletedAt: null, hiddenAt: null, AND: [SIN_AUTOPOSTS], OR: [{ authorPageId: { in: ids } }, { wallPageId: { in: ids } }] },
           orderBy: postOrder(asSort(query.sort)), skip: pg * limit, take: limit + 1,
           include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true },
         })
@@ -1136,7 +1142,7 @@ export const v1 = () =>
         items = rows.slice(0, limit)
       } else if (scope === 'recent') {
         const rows = await prisma.post.findMany({
-          where: { appId: auth.appId, deletedAt: null, hiddenAt: null },
+          where: { appId: auth.appId, deletedAt: null, hiddenAt: null, ...SIN_AUTOPOSTS },
           orderBy: postOrder(asSort(query.sort)), skip: pg * limit, take: limit + 1,
           include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true },
         })
@@ -1151,6 +1157,7 @@ export const v1 = () =>
           SELECT id FROM post
           WHERE "appId" = ${auth.appId}
             AND "deletedAt" IS NULL AND "hiddenAt" IS NULL
+            AND ("externalRef" IS NULL OR "externalRef" NOT LIKE 'chapter:%')
             AND "createdAt" > NOW() - (${days} || ' days')::interval
           ORDER BY (
             ("likesCount" * 3 + "commentsCount" * 5 + 1)::float
@@ -1168,7 +1175,7 @@ export const v1 = () =>
         // Si la ventana esta vacia (app recien estrenada), no dejamos el feed en blanco.
         if (!items.length && pg === 0) {
           const rows = await prisma.post.findMany({
-            where: { appId: auth.appId, deletedAt: null, hiddenAt: null },
+            where: { appId: auth.appId, deletedAt: null, hiddenAt: null, ...SIN_AUTOPOSTS },
             orderBy: [{ createdAt: 'desc' }], take: limit + 1, include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true },
           })
           has = rows.length > limit
