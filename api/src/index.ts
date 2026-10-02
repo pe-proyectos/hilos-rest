@@ -84,12 +84,12 @@ const app = new Elysia()
 console.log(`hilos.rest api on :${(app.server?.port) || process.env.PORT || 3100}`)
 export type App = typeof app
 
-// Backfill del flag `automated` (idempotente, en cada arranque): los posts que
+// Backfill del flag `automated` (idempotente, al arrancar y cada 30 min): los posts que
 // la app publica sola antes de que existiera el flag. Avisos de capitulo
 // (externalRef 'chapter:<id>'), anclas de la caja de comentarios de una obra
 // ('manga:<id>') y avisos de un scan con el formato exacto "Capitulo N" o
 // "Capitulo N: titulo". Los nuevos ya llegan marcados por la app.
-prisma.$executeRaw`
+const marcarAutomaticos = () => prisma.$executeRaw`
   UPDATE post SET automated = true
   WHERE automated = false AND (
     "externalRef" LIKE 'chapter:%'
@@ -99,3 +99,7 @@ prisma.$executeRaw`
   )`
   .then((n) => { if (n > 0) console.log(`[automated] ${n} posts marcados como automaticos`) })
   .catch((e) => console.error('[automated] backfill:', e?.message || e))
+marcarAutomaticos()
+// Red de seguridad: cubre posts que lleguen sin el flag (p. ej. de una app
+// todavia sin actualizar). Barato: solo mira posts con automated = false.
+setInterval(marcarAutomaticos, 30 * 60 * 1000)
