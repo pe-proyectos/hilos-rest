@@ -8,11 +8,10 @@ import { cifrar, descifrar } from '../lib/secret'
 import { randomBytes, createHmac } from 'crypto'
 import { listInbox, inboxCounts, buildSummaries, messageMeta, messageMedia, engagedConversations } from '../lib/inbox'
 
-// Avisos automaticos de capitulo nuevo (externalRef 'chapter:<id>'): existen
-// porque de ellos cuelgan las cajas de comentarios de cada capitulo, pero no se
-// muestran en el feed (inicio, siguiendo, recientes): lo llenaban de spam. Ojo:
-// "NOT LIKE" en SQL tambien descarta los NULL, por eso el OR explicito.
-const SIN_AUTOPOSTS = { OR: [{ externalRef: null }, { NOT: { externalRef: { startsWith: 'chapter:' } } }] }
+// Posts automaticos (flag `automated`: avisos de capitulo nuevo, anclas de la
+// caja de comentarios de cada obra). Existen porque de ellos cuelgan los
+// comentarios, pero no se muestran en el feed (inicio, siguiendo, recientes).
+const SIN_AUTOMATICOS = { automated: false }
 
 const SECRET = process.env.HILOS_JWT_SECRET || 'dev-secret'
 const MAX_CONTENT = 8000
@@ -69,7 +68,7 @@ function shapePost(p: any, likedSet?: Set<number>, savedSet?: Set<number>) {
           myVote: p.__myVote ?? null,
         }
       : null,
-    media: p.media ?? null, repostOfId: p.repostOfId ?? null, externalRef: p.externalRef ?? null,
+    media: p.media ?? null, repostOfId: p.repostOfId ?? null, externalRef: p.externalRef ?? null, automated: !!p.automated,
     likesCount: p.likesCount, commentsCount: p.commentsCount, repostCount: p.repostCount, pinned: p.pinned,
     createdAt: p.createdAt, liked: likedSet ? likedSet.has(p.id) : undefined, saved: savedSet ? savedSet.has(p.id) : undefined,
     author: shapePage(p.author), wallPageId: p.wallPageId,
@@ -947,6 +946,8 @@ export const v1 = () =>
       // externalRef, metadata y createdAt son cosa de la app (auto-posts,
       // migraciones): con page token se ignoran. La fecha nunca va al futuro.
       const externalRef = secreta && body.externalRef ? String(body.externalRef) : null
+      // Solo la app (clave secreta) marca un post como automatico.
+      const automated = !!(secreta && body.automated === true)
       let createdAt: Date | undefined
       if (secreta && body.createdAt) {
         const d = fechaNoFutura(body.createdAt)
@@ -973,7 +974,7 @@ export const v1 = () =>
         ...(programado ? { revealAt, secretContent: cifrar(content) } : {}),
         ...(body.countdownAt ? { countdownAt: new Date(body.countdownAt), countdownLabel: body.countdownLabel ? String(body.countdownLabel).slice(0, 120) : null } : {}),
         media: body.media ?? undefined,
-        repostOfId: body.repostOfId ? Number(body.repostOfId) : null, externalRef,
+        repostOfId: body.repostOfId ? Number(body.repostOfId) : null, externalRef, automated,
         metadata: secreta ? (body.metadata ?? undefined) : undefined, createdAt,
       }, include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true } })
       notifyMentions(auth.appId, content, authorPageId, { postId: post.id })
@@ -1134,7 +1135,7 @@ export const v1 = () =>
         const f = await prisma.follow.findMany({ where: { appId: auth.appId, followerPageId: viewer }, select: { followedPageId: true } })
         const ids = [...f.map((x) => x.followedPageId), viewer]
         const rows = await prisma.post.findMany({
-          where: { appId: auth.appId, deletedAt: null, hiddenAt: null, AND: [SIN_AUTOPOSTS], OR: [{ authorPageId: { in: ids } }, { wallPageId: { in: ids } }] },
+          where: { appId: auth.appId, deletedAt: null, hiddenAt: null, ...SIN_AUTOMATICOS, OR: [{ authorPageId: { in: ids } }, { wallPageId: { in: ids } }] },
           orderBy: postOrder(asSort(query.sort)), skip: pg * limit, take: limit + 1,
           include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true },
         })
@@ -1142,7 +1143,7 @@ export const v1 = () =>
         items = rows.slice(0, limit)
       } else if (scope === 'recent') {
         const rows = await prisma.post.findMany({
-          where: { appId: auth.appId, deletedAt: null, hiddenAt: null, ...SIN_AUTOPOSTS },
+          where: { appId: auth.appId, deletedAt: null, hiddenAt: null, ...SIN_AUTOMATICOS },
           orderBy: postOrder(asSort(query.sort)), skip: pg * limit, take: limit + 1,
           include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true },
         })
@@ -1157,7 +1158,7 @@ export const v1 = () =>
           SELECT id FROM post
           WHERE "appId" = ${auth.appId}
             AND "deletedAt" IS NULL AND "hiddenAt" IS NULL
-            AND ("externalRef" IS NULL OR "externalRef" NOT LIKE 'chapter:%')
+            AND "automated" = false
             AND "createdAt" > NOW() - (${days} || ' days')::interval
           ORDER BY (
             ("likesCount" * 3 + "commentsCount" * 5 + 1)::float
@@ -1175,7 +1176,7 @@ export const v1 = () =>
         // Si la ventana esta vacia (app recien estrenada), no dejamos el feed en blanco.
         if (!items.length && pg === 0) {
           const rows = await prisma.post.findMany({
-            where: { appId: auth.appId, deletedAt: null, hiddenAt: null, ...SIN_AUTOPOSTS },
+            where: { appId: auth.appId, deletedAt: null, hiddenAt: null, ...SIN_AUTOMATICOS },
             orderBy: [{ createdAt: 'desc' }], take: limit + 1, include: { author: { select: pageSel }, wall: { select: wallSel }, poll: true },
           })
           has = rows.length > limit

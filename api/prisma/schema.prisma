@@ -128,8 +128,13 @@ model Post {
   // Cuenta atrás hacia una fecha (un estreno, un capítulo).
   countdownAt    DateTime? @db.Timestamp(6)
   countdownLabel String?   @db.VarChar(120)
+  // Publicado por la app consumidora de forma automatica (aviso de capitulo
+  // nuevo, ancla de la caja de comentarios de una obra...). Existe para que
+  // cuelguen los comentarios, pero no se muestra en el feed.
+  automated      Boolean   @default(false)
 
   @@unique([appId, externalRef])
+  @@index([appId, automated, createdAt])
   @@index([appId, wallPageId, createdAt])
   @@index([appId, authorPageId, createdAt])
   @@index([appId, createdAt])

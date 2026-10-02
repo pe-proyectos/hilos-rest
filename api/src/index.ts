@@ -83,3 +83,19 @@ const app = new Elysia()
 
 console.log(`hilos.rest api on :${(app.server?.port) || process.env.PORT || 3100}`)
 export type App = typeof app
+
+// Backfill del flag `automated` (idempotente, en cada arranque): los posts que
+// la app publica sola antes de que existiera el flag. Avisos de capitulo
+// (externalRef 'chapter:<id>'), anclas de la caja de comentarios de una obra
+// ('manga:<id>') y avisos de un scan con el formato exacto "Capitulo N" o
+// "Capitulo N: titulo". Los nuevos ya llegan marcados por la app.
+prisma.$executeRaw`
+  UPDATE post SET automated = true
+  WHERE automated = false AND (
+    "externalRef" LIKE 'chapter:%'
+    OR "externalRef" LIKE 'manga:%'
+    OR ("authorPageId" IN (SELECT id FROM page WHERE type = 'scan')
+        AND content ~ '^Cap[ií]tulo [0-9]+([.,][0-9]+)?(: .*)?$')
+  )`
+  .then((n) => { if (n > 0) console.log(`[automated] ${n} posts marcados como automaticos`) })
+  .catch((e) => console.error('[automated] backfill:', e?.message || e))
