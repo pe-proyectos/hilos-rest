@@ -12,6 +12,8 @@ import { listInbox, inboxCounts, buildSummaries, messageMeta, messageMedia, enga
 // caja de comentarios de cada obra). Existen porque de ellos cuelgan los
 // comentarios, pero no se muestran en el feed (inicio, siguiendo, recientes).
 const SIN_AUTOMATICOS = { automated: false }
+const esAutomaticoPorConvencion = (ref: string | null) =>
+  !!ref && (ref.startsWith('chapter:') || ref.startsWith('manga:'))
 
 const SECRET = process.env.HILOS_JWT_SECRET || 'dev-secret'
 const MAX_CONTENT = 8000
@@ -946,8 +948,10 @@ export const v1 = () =>
       // externalRef, metadata y createdAt son cosa de la app (auto-posts,
       // migraciones): con page token se ignoran. La fecha nunca va al futuro.
       const externalRef = secreta && body.externalRef ? String(body.externalRef) : null
-      // Solo la app (clave secreta) marca un post como automatico.
-      const automated = !!(secreta && body.automated === true)
+      // Solo la app (clave secreta) marca un post como automatico. Si no manda
+      // el flag, cuentan sus referencias de aviso de capitulo ('chapter:') o de
+      // ancla de obra ('manga:'), para que nunca lleguen al feed.
+      const automated = !!(secreta && (body.automated === true || esAutomaticoPorConvencion(externalRef)))
       let createdAt: Date | undefined
       if (secreta && body.createdAt) {
         const d = fechaNoFutura(body.createdAt)
