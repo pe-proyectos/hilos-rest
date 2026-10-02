@@ -3,7 +3,8 @@
 // Cliente: pásale un pageToken (obtenido con secretKey en tu backend).
 
 export interface HilosPage { id: number; handle: string; type: string; parentPageId: number | null; externalId: string | null; displayName: string | null; avatarUrl: string | null; bio: string | null; followersCount: number; followingCount: number; postsCount: number }
-export interface HilosPost { id: number; content: string; media: any; repostOfId: number | null; externalRef: string | null; likesCount: number; commentsCount: number; repostCount: number; pinned: boolean; createdAt: string; liked?: boolean; author: HilosPage; wallPageId: number }
+export interface HilosPostChapter { ref: string | null; id: number | null; number: string | null; url: string | null }
+export interface HilosPost { id: number; content: string; media: any; repostOfId: number | null; externalRef: string | null; likesCount: number; commentsCount: number; repostCount: number; pinned: boolean; createdAt: string; liked?: boolean; author: HilosPage; wallPageId: number; chapter?: HilosPostChapter | null }
 export interface HilosComment { id: number; content: string; parentCommentId: number | null; likesCount: number; createdAt: string; author: HilosPage }
 export interface Paged<T> { items: T[]; hasMore: boolean }
 

@@ -25,6 +25,11 @@ Stack: Bun + Elysia + Prisma + PostgreSQL.
 `GET|POST /v1/posts/:id/comments`, `DELETE /v1/comments/:id`,
 `POST /v1/posts/:id/like`, `POST /v1/pages/:handle/follow`.
 
+Capítulos: con secret key, `POST /v1/posts` acepta `metadata.chapter = { id, number, url }`
+(url https al lector). Los posts salen con `chapter: { ref, id, number, url } | null`,
+que también se deriva de `externalRef: 'chapter:<id>'` + "Capítulo N"/"Chapter N" en el
+texto (url null en ese caso). `GET /v1/notifications` añade `chapter` (con `work`) por aviso.
+
 ### Mensajería
 `GET /v1/conversations`, `GET /v1/conversations/:id/messages`,
 `POST /v1/conversations/:id/archive`, `POST /v1/messages`, `GET /v1/messages/unread`.

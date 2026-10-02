@@ -7,6 +7,7 @@ import { s3, R2_PUBLIC } from '../lib/s3'
 import { cifrar, descifrar } from '../lib/secret'
 import { randomBytes, createHmac } from 'crypto'
 import { listInbox, inboxCounts, buildSummaries, messageMeta, messageMedia, engagedConversations } from '../lib/inbox'
+import { capituloDePost } from '../lib/capitulo'
 
 // Posts automaticos (flag `automated`: avisos de capitulo nuevo, anclas de la
 // caja de comentarios de cada obra). Existen porque de ellos cuelgan los
@@ -76,6 +77,8 @@ function shapePost(p: any, likedSet?: Set<number>, savedSet?: Set<number>) {
     author: shapePage(p.author), wallPageId: p.wallPageId,
     // Solo cuando el muro es otra page (p. ej. la obra donde se publica el capítulo).
     wall: p.wall && p.wall.id !== p.authorPageId ? shapePage(p.wall) : null,
+    // Capítulo del que habla el post (y sus comentarios), si lo hay. La obra es `wall`.
+    chapter: capituloDePost(p),
   }
 }
 // Webhooks: hilos no sabe de correos ni de roles. Publica el evento firmado y
@@ -1288,11 +1291,27 @@ export const v1 = () =>
         include: { actor: { select: pageSel } },
       })
       const hasMore = rows.length > limit
+      const shown = rows.slice(0, limit)
+      // Si el aviso es de un capítulo (p. ej. te respondieron en los comentarios
+      // del capítulo 12), la app puede decir cuál y de qué obra.
+      const postIds = [...new Set(shown.map((n) => n.postId).filter((id): id is number => id != null))]
+      const posts = postIds.length
+        ? await prisma.post.findMany({
+            where: { id: { in: postIds }, appId: auth.appId },
+            select: { id: true, externalRef: true, content: true, metadata: true, wall: { select: { handle: true, type: true, displayName: true, parent: { select: { handle: true } } } } },
+          }).catch(() => [])
+        : []
+      const capPorPost = new Map(posts.map((p) => {
+        const cap = capituloDePost(p)
+        const w = p.wall
+        return [p.id, cap ? { ...cap, work: w && w.type === 'manga' ? { handle: w.handle, displayName: w.displayName, parentHandle: w.parent?.handle ?? null } : null } : null]
+      }))
       return {
         data: {
-          items: rows.slice(0, limit).map((n) => ({
+          items: shown.map((n) => ({
             id: n.id, type: n.type, postId: n.postId, commentId: n.commentId,
             preview: n.preview, read: !!n.readAt, createdAt: n.createdAt, actor: shapePage(n.actor),
+            chapter: n.postId != null ? capPorPost.get(n.postId) ?? null : null,
           })),
           hasMore,
         },
