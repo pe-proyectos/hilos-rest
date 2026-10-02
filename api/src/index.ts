@@ -1,5 +1,5 @@
 import { Elysia } from 'elysia'
-import { v1 } from './routes/v1'
+import { v1, barridoRevelados } from './routes/v1'
 import { landingHtml } from './web/landing'
 import { prisma } from './lib/prisma'
 
@@ -103,3 +103,6 @@ marcarAutomaticos()
 // Red de seguridad: cubre posts que lleguen sin el flag (p. ej. de una app
 // todavia sin actualizar). Barato: solo mira posts con automated = false.
 setInterval(marcarAutomaticos, 30 * 60 * 1000)
+
+// post.created de los mensajes programados: se emite cuando se revelan.
+setInterval(barridoRevelados, 60 * 1000)

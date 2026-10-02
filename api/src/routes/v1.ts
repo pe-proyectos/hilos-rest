@@ -104,6 +104,76 @@ function emitEvent(appId: number, type: string, data: any) {
   }).catch(() => {})
 }
 
+// URL pública de un post en la app consumidora. HILOS_POST_URLS es un JSON
+// { "<appId>": "https://lacharca.com/post/{id}" }; sin plantilla, null.
+let plantillasPost: Record<string, string> | null = null
+function urlPublicaPost(appId: number, id: number): string | null {
+  if (!plantillasPost) {
+    try { plantillasPost = JSON.parse(process.env.HILOS_POST_URLS || '{}') || {} } catch { plantillasPost = {} }
+  }
+  const t = plantillasPost![String(appId)]
+  return typeof t === 'string' && t.includes('{id}') ? t.replace('{id}', String(id)) : null
+}
+
+// Mismo formato que el backfill de `automated` (index.ts): aviso de capítulo
+// de un scan que llegó sin el flag.
+const AVISO_CAPITULO = /^Cap[ií]tulo [0-9]+([.,][0-9]+)?(: .*)?$/
+const marcaAdulto = (m: any) => !!m && typeof m === 'object' && (m.nsfw === true || m.adult === true)
+
+// Evento `post.created`: solo posts padre visibles de personas (nada
+// automático, ni reposts, ni ocultos/borrados). Un post programado se emite
+// al revelarse (barridoRevelados), no al crearse. La app deduplica por id.
+export async function emitPostCreated(appId: number, postId: number) {
+  const p: any = await prisma.post.findFirst({
+    where: { id: postId, appId },
+    include: {
+      author: { select: { handle: true, displayName: true, avatarUrl: true, externalId: true, type: true, metadata: true } },
+      wall: { select: { handle: true, displayName: true, externalId: true, type: true, metadata: true } },
+      poll: { select: { options: true, endsAt: true } },
+    },
+  }).catch(() => null)
+  if (!p || p.automated || p.repostOfId || p.deletedAt || p.hiddenAt) return
+  if (p.revealAt && new Date(p.revealAt) > new Date()) return
+  const content = p.revealAt && p.secretContent ? descifrar(p.secretContent) : p.content
+  if (p.author?.type === 'scan' && AVISO_CAPITULO.test(String(content || '').trim())) return
+  const media = Array.isArray(p.media) ? p.media : []
+  const imagen = media
+    .map((m: any) => (typeof m === 'string' ? m : m?.url))
+    .find((u: any) => typeof u === 'string' && /^https:\/\//.test(u)) ?? null
+  emitEvent(appId, 'post.created', {
+    post: {
+      id: p.id,
+      url: urlPublicaPost(appId, p.id),
+      content,
+      image: imagen,
+      poll: p.poll ? { options: Array.isArray(p.poll.options) ? p.poll.options : [], endsAt: p.poll.endsAt } : null,
+      createdAt: p.revealAt ?? p.createdAt,
+      nsfw: marcaAdulto(p.metadata) || marcaAdulto(p.wall?.metadata) || marcaAdulto(p.author?.metadata),
+    },
+    author: { handle: p.author.handle, displayName: p.author.displayName, avatarUrl: p.author.avatarUrl, externalId: p.author.externalId, type: p.author.type },
+    wall: p.wall && p.wallPageId !== p.authorPageId
+      ? { handle: p.wall.handle, displayName: p.wall.displayName, externalId: p.wall.externalId, type: p.wall.type }
+      : null,
+  })
+}
+
+// Programados que se revelaron desde el último barrido (cada minuto, desde
+// index.ts). Al arrancar mira la última hora: puede repetir, la app deduplica.
+let ultimoBarrido = Date.now() - 60 * 60_000
+export async function barridoRevelados() {
+  const hasta = new Date()
+  const desde = new Date(ultimoBarrido)
+  const posts = await prisma.post.findMany({
+    where: { revealAt: { gt: desde, lte: hasta }, automated: false, repostOfId: null, deletedAt: null, hiddenAt: null },
+    select: { id: true, appId: true },
+    orderBy: { revealAt: 'asc' },
+    take: 500,
+  }).catch(() => null)
+  if (!posts) return
+  ultimoBarrido = hasta.getTime()
+  for (const p of posts) emitPostCreated(p.appId, p.id).catch(() => {})
+}
+
 // Los avisos nunca deben tumbar la accion que los genera: si fallan, se pierden
 // en silencio y el usuario igual ve su comentario publicado.
 function notify(appId: number, pageId: number, actorPageId: number | null, type: string, extra: { postId?: number; commentId?: number; preview?: string } = {}) {
@@ -1003,6 +1073,9 @@ export const v1 = () =>
       const tags = parseHashtags(content)
       if (tags.length) await prisma.hashtag.createMany({ data: tags.map((tag) => ({ appId: auth.appId, postId: post.id, tag })) }).catch(() => {})
       await prisma.page.update({ where: { id: authorPageId }, data: { postsCount: { increment: 1 } } }).catch(() => {})
+      // Aviso a la app (feed de Discord de La Charca...). Los programados salen
+      // al revelarse, desde barridoRevelados.
+      if (!programado) emitPostCreated(auth.appId, post.id).catch(() => {})
       return { data: shapePost(post) }
     }, { body: t.Object({
       content: t.Optional(t.String()), media: t.Optional(t.Any()),
