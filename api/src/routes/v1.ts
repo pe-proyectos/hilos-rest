@@ -1163,11 +1163,15 @@ export const v1 = () =>
           WHERE "appId" = ${auth.appId}
             AND "deletedAt" IS NULL AND "hiddenAt" IS NULL
             AND "automated" = false
-            AND "createdAt" > NOW() - (${days} || ' days')::interval
-          ORDER BY (
-            ("likesCount" * 3 + "commentsCount" * 5 + 1)::float
-            / POWER(GREATEST(EXTRACT(EPOCH FROM (NOW() - "createdAt")) / 3600.0, 0) + 2.0, 1.4)
-          ) DESC, "createdAt" DESC
+          -- Primero lo de la ventana corta, ordenado por relevancia; despues todo
+          -- lo anterior por fecha, para que el scroll infinito no se corte cuando
+          -- la ventana tiene pocos posts.
+          ORDER BY ("createdAt" > NOW() - (${days} || ' days')::interval) DESC,
+            CASE WHEN "createdAt" > NOW() - (${days} || ' days')::interval THEN (
+              ("likesCount" * 3 + "commentsCount" * 5 + 1)::float
+              / POWER(GREATEST(EXTRACT(EPOCH FROM (NOW() - "createdAt")) / 3600.0, 0) + 2.0, 1.4)
+            ) END DESC NULLS LAST,
+            "createdAt" DESC
           LIMIT ${limit + 1} OFFSET ${pg * limit}`
         const ids = ranked.map((r) => r.id)
         has = ids.length > limit
