@@ -33,7 +33,7 @@ async function landingStats() {
 }
 
 const CORS_HEADERS = 'authorization, content-type, x-hilos-page, x-bootstrap-token'
-const CORS_METHODS = 'GET, POST, DELETE, OPTIONS'
+const CORS_METHODS = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
 
 // CORS manual: el plugin no reflejaba el Origin con un allowlist asincrono,
 // y sin Access-Control-Allow-Origin el navegador bloquea toda accion del cliente.
